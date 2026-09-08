@@ -250,7 +250,7 @@ impl PolicyConfig {
     pub fn try_into_capabilities(self) -> Result<Vec<Capability>, ConfigError> {
         self.capabilities
             .into_iter()
-            .map(|c| c.try_into())
+            .map(|c| c.into_capability())
             .collect()
     }
 }
@@ -265,7 +265,7 @@ impl CapabilityDef {
     }
 
     /// Convert a capability definition to a typed `Capability` enum (REQ-306).
-    fn try_into(self) -> Result<Capability, ConfigError> {
+    pub fn into_capability(self) -> Result<Capability, ConfigError> {
         match self {
             CapabilityDef::FilesystemRead {
                 allowed_root,

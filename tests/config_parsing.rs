@@ -232,7 +232,7 @@ max_read_bytes = 512
                 CapabilityDef::FilesystemRead { max_read_bytes, .. } => {
                     assert_eq!(*max_read_bytes, 512);
                 }
-                other => panic!("Expected FilesystemRead, got: {:?}", other),
+                _ => panic!("Expected FilesystemRead in fallback test fixture"),
             }
         }
         // If fallback path also doesn't exist (e.g., in CI), NotFound is also valid
@@ -338,25 +338,36 @@ fn capability_def_try_into_network_http() {
 
 #[test]
 fn capability_def_try_into_invalid_path_error() {
-    // Test InvalidPath from try_into() in isolation by creating a config that passes
-    // validate() but fails canonicalization in try_into() — use a path that exists but
-    // whose parent chain fails canonicalization (e.g., symlink loop or permission issue).
-    // For practical purposes, we test that try_into() re-validates and can produce InvalidPath.
-    // Since validate() already catches this, we verify the conversion pipeline works.
+    // Test InvalidPath from try_into() in ISOLATION by bypassing validate()
+    // and directly constructing a CapabilityDef with a path that fails canonicalization.
+    // This tests the try_into() code path independently of validate().
 
-    let config =
-        PolicyConfig::load("tests/fixtures/config/valid.toml").expect("Should load valid config");
+    // Create a broken symlink: link -> link (self-referential loop)
+    let tmp = tempfile::tempdir().unwrap();
+    let broken_link = tmp.path().join("broken_loop");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&broken_link, &broken_link).unwrap();
+    #[cfg(windows)]
+    {
+        // On Windows, use a junction-like approach or skip
+        std::fs::write(&broken_link, "dummy").unwrap();
+    }
 
-    let capabilities = config
-        .try_into_capabilities()
-        .expect("Should convert capabilities");
+    // Construct CapabilityDef directly (bypassing validate())
+    let cap_def = CapabilityDef::FilesystemRead {
+        allowed_root: broken_link.to_string_lossy().to_string(),
+        max_read_bytes: 1024,
+    };
 
-    assert_eq!(capabilities.len(), 1);
-    match &capabilities[0] {
-        Capability::FilesystemRead(params) => {
-            assert!(params.allowed_root.is_absolute());
-        }
-        other => panic!("Expected FilesystemRead, got: {:?}", other),
+    // Call into_capability() directly — this should fail with InvalidPath due to symlink loop
+    let result = cap_def.into_capability();
+
+    match result {
+        Err(ConfigError::InvalidPath { .. }) => {}
+        other => panic!(
+            "Expected InvalidPath from into_capability() isolation, got: {:?}",
+            other
+        ),
     }
 }
 
