@@ -1,0 +1,3 @@
+[[capabilities]]
+name = "filesystem.read"
+allowed_root = "/tmp"

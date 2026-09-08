@@ -1,0 +1,4 @@
+[[capabilities]]
+name = "filesystem.read"
+allowed_root = "relative/path"
+max_read_bytes = 1048576

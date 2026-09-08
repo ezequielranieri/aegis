@@ -1,0 +1,14 @@
+[[capabilities]]
+name = "filesystem.read"
+allowed_root = "/tmp"
+max_read_bytes = 1048576
+
+[[capabilities]]
+name = "filesystem.write"
+allowed_root = "/tmp"
+max_write_bytes = 2097152
+
+[[capabilities]]
+name = "network.http"
+allowed_hosts = ["example.com"]
+max_requests_per_second = 10

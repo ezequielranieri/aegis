@@ -1,0 +1,9 @@
+[[capabilities]]
+name = "filesystem.read"
+allowed_root = "/tmp"
+max_read_bytes = 1048576
+
+[[capabilities]]
+name = "filesystem.read"
+allowed_root = "/tmp"
+max_read_bytes = 2048
