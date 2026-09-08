@@ -1,0 +1,26 @@
+# Rust
+target/
+Cargo.lock
+
+# Local Pi runtime state
+.atl/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.tmp
+temp/
+
+# Verification reports (generated)
+verify-report.md
+
+# Spike/experimentation
+spike/

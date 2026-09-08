@@ -1,0 +1,22 @@
+# Aegis Signing Key Configuration
+# ================================
+#
+# This file contains Ed25519 key pair for signing execution receipts.
+# The private key MUST be kept secret and the file MUST have 0600 permissions.
+#
+# Generate a new key pair:
+#   openssl genpkey -algorithm Ed25519 -outform PEM | \
+#     openssl pkey -outform DER | base64 > private_key.b64
+#   openssl pkey -in private_key.pem -pubout -outform DER | base64 > public_key.b64
+#
+# Or use the Rust ring crate:
+#   let rng = ring::rand::SystemRandom::new();
+#   let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+#   // base64-encode pkcs8.as_ref() for private_key
+#   // base64-encode key_pair.public_key().as_ref() for public_key
+#
+# Set permissions: chmod 600 /etc/aegis/signing_key.toml
+
+[signing_key]
+private_key = "BASE64_ENCODED_PKCS8_PRIVATE_KEY"
+public_key = "BASE64_ENCODED_ED25519_PUBLIC_KEY"
