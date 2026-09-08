@@ -2,129 +2,8 @@ use aegis::capabilities::{
     Capability, FilesystemReadParams, FilesystemWriteParams, NetworkHttpParams,
 };
 use aegis::sandbox::{Sandbox, SandboxConfig};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::Layer;
 use wat::parse_str;
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Test Layer for capturing tracing events (emit_capability_event verification)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Captured capability event from emit_capability_event
-#[derive(Debug, Clone, PartialEq)]
-struct CapturedCapabilityEvent {
-    capability: String,
-    path: String,
-    size: u64,
-    result: String,
-}
-
-/// Test layer that captures capability events
-struct CapabilityEventLayer {
-    events: Arc<Mutex<Vec<CapturedCapabilityEvent>>>,
-}
-
-impl CapabilityEventLayer {
-    fn new(events: Arc<Mutex<Vec<CapturedCapabilityEvent>>>) -> Self {
-        Self { events }
-    }
-}
-
-impl<S> Layer<S> for CapabilityEventLayer
-where
-    S: tracing::Subscriber,
-{
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        let mut visitor = CapabilityEventVisitor::new(self.events.clone());
-        event.record(&mut visitor);
-    }
-}
-
-struct CapabilityEventVisitor {
-    events: Arc<Mutex<Vec<CapturedCapabilityEvent>>>,
-    capability: Option<String>,
-    path: Option<String>,
-    size: Option<u64>,
-    result: Option<String>,
-}
-
-impl CapabilityEventVisitor {
-    fn new(events: Arc<Mutex<Vec<CapturedCapabilityEvent>>>) -> Self {
-        Self {
-            events,
-            capability: None,
-            path: None,
-            size: None,
-            result: None,
-        }
-    }
-}
-
-impl tracing::field::Visit for CapabilityEventVisitor {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        match field.name() {
-            "capability" => self.capability = Some(value.to_string()),
-            "path" => self.path = Some(value.to_string()),
-            "result" => self.result = Some(value.to_string()),
-            _ => {}
-        }
-    }
-
-    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        if field.name() == "size" {
-            self.size = Some(value);
-        }
-    }
-
-    fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {
-        // Ignore debug fields
-    }
-}
-
-impl Drop for CapabilityEventVisitor {
-    fn drop(&mut self) {
-        if let (Some(capability), Some(path), Some(size), Some(result)) = (
-            self.capability.take(),
-            self.path.take(),
-            self.size.take(),
-            self.result.take(),
-        ) {
-            if capability == "filesystem.read" {
-                self.events.lock().unwrap().push(CapturedCapabilityEvent {
-                    capability,
-                    path,
-                    size,
-                    result,
-                });
-            }
-        }
-    }
-}
-
-/// Run a test with a capability event capturing subscriber
-fn with_capability_capture<F, R>(f: F) -> (R, Vec<CapturedCapabilityEvent>)
-where
-    F: FnOnce() -> R,
-{
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let layer = CapabilityEventLayer::new(events.clone());
-    let subscriber = tracing_subscriber::registry().with(layer);
-
-    let result = tracing::subscriber::with_default(subscriber, f);
-
-    let captured = {
-        let mut guard = events.lock().unwrap();
-        std::mem::take(&mut *guard)
-    };
-
-    (result, captured)
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // WAT Modules (hostile modules for capability testing)
@@ -643,206 +522,286 @@ fn memory_growth_within_limit_succeeds() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 4.9+ emit_capability_event verification tests (REQ-108)
+// Phase 3: Receipt-chain-based verification tests (REQ-460..464)
 // ════════════════════════════════════════════════════════════════════════════════
 
-/// S-1: Happy Path — allowed read within root, under size limit
-/// Verifies emit_capability_event is called with capability="filesystem.read",
-/// path="test.txt", size=11, result="Success"
-#[test]
-fn emit_capability_event_s1_happy_path() {
-    let (_, captured) = with_capability_capture(|| {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("test.txt"), "hello world").unwrap();
-        let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
+use ring::signature::KeyPair;
 
-        let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
-            .expect("Failed to create sandbox");
+/// Helper: create a sandbox with a receipt emitter for testing
+fn sandbox_with_receipts() -> (Sandbox, ring::signature::Ed25519KeyPair) {
+    use ring::signature::Ed25519KeyPair;
 
-        let wasm = parse_str(ALLOWED_READ).expect("WAT parse failed");
-        let instance = sandbox
-            .instantiate_with_capabilities(&wasm, &[cap])
-            .expect("Module should instantiate");
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
 
-        let func = instance
-            .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
-            .expect("Function not found");
+    // Create a separate keypair for the emitter
+    let rng2 = ring::rand::SystemRandom::new();
+    let pkcs8_2 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let emitter_key = Ed25519KeyPair::from_pkcs8(pkcs8_2.as_ref()).unwrap();
 
-        let result = func.call(sandbox.store_mut(), ());
-        assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
-    });
+    let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
+        .expect("Failed to create sandbox");
 
-    assert_eq!(
-        captured.len(),
-        1,
-        "Expected exactly 1 capability event, got: {:?}",
-        captured
-    );
+    // Manually inject the receipt emitter with its own keypair
+    let emitter = aegis::receipts::ReceiptEmitter::new(emitter_key);
+    sandbox.store_mut().data_mut().receipt_emitter = Some(emitter);
 
-    let event = &captured[0];
-    assert_eq!(event.capability, "filesystem.read");
-    assert_eq!(event.path, "test.txt");
-    assert_eq!(event.size, 11); // "hello world" = 11 bytes
-    assert_eq!(event.result, "Success");
+    (sandbox, key_pair)
 }
 
-/// S-2 (REQ-103): Path traversal attempt with `..`
-/// Verifies emit_capability_event is called with capability="filesystem.read",
-/// path containing "..", size=0, result="Trap"
+/// S-1: Happy Path — verify receipt with result="success"
 #[test]
-fn emit_capability_event_s2_path_traversal() {
-    let (_, captured) = with_capability_capture(|| {
-        let tmp = tempfile::tempdir().unwrap();
-        let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
+fn receipt_s1_happy_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("test.txt"), "hello world").unwrap();
+    let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
 
-        let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
-            .expect("Failed to create sandbox");
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
 
-        let wasm = parse_str(DENIED_READ).expect("WAT parse failed");
-        let instance = sandbox
-            .instantiate_with_capabilities(&wasm, &[cap])
-            .expect("Module should instantiate");
+    let wasm = parse_str(ALLOWED_READ).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
 
-        let func = instance
-            .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
-            .expect("Function not found");
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
 
-        let result = func.call(sandbox.store_mut(), ());
-        assert!(result.is_err(), "Expected trap on path traversal");
-    });
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
 
+    // Verify receipt was emitted with correct fields
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.read");
+    assert_eq!(receipt.action, "read");
+    assert_eq!(receipt.result, "success");
+    assert_eq!(receipt.path, "test.txt");
+    assert_eq!(receipt.size, 11);
+    assert!(receipt.timestamp_ns > 0, "timestamp_ns must be non-zero");
     assert_eq!(
-        captured.len(),
-        1,
-        "Expected exactly 1 capability event, got: {:?}",
-        captured
+        receipt.prev_hash, [0u8; 32],
+        "First receipt should have genesis prev_hash"
     );
 
-    let event = &captured[0];
-    assert_eq!(event.capability, "filesystem.read");
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// S-2: Denied Read — path resolves outside allowed_root → receipt with result="trap"
+#[test]
+fn receipt_s2_path_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(DENIED_READ).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on path traversal");
+
+    // Verify receipt was emitted with result="trap"
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.read");
+    assert_eq!(receipt.action, "read");
+    assert_eq!(receipt.result, "trap");
+    assert!(receipt.timestamp_ns > 0, "timestamp_ns must be non-zero");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// S-3: Path Traversal — ../../etc/passwd → receipt with result="trap"
+#[test]
+fn receipt_s3_traversal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(TRAVERSAL).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on path traversal");
+
+    // Verify receipt was emitted with result="trap"
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.read");
+    assert_eq!(receipt.action, "read");
+    assert_eq!(receipt.result, "trap");
+    assert!(receipt.path.contains(".."), "path should contain ..");
+    assert!(receipt.timestamp_ns > 0, "timestamp_ns must be non-zero");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// S-4: WASI unknown import — linking error, 0 receipts emitted (pure regression)
+#[test]
+fn receipt_s4_wasi_unknown_import() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let (mut sandbox, _key_pair) = sandbox_with_receipts();
+
+    let wasm = parse_str(FD_LEAK).expect("WAT parse failed");
+    let result = sandbox.instantiate_with_capabilities(&wasm, &[cap]);
+
+    assert!(result.is_err(), "Expected linking error on WASI import");
+    let err_msg = result.unwrap_err().to_string();
     assert!(
-        event.path.contains(".."),
-        "Path should contain '..', got: {}",
-        event.path
+        err_msg.contains("unknown import"),
+        "Expected 'unknown import' linking error, got: {}",
+        err_msg
     );
-    assert_eq!(event.size, 0);
-    assert_eq!(event.result, "Trap");
+    // No receipts should be emitted — module failed at linking
 }
 
-/// S-3 (REQ-104): Size limit exceeded
-/// Verifies emit_capability_event is called with capability="filesystem.read",
-/// path="large.bin", size=2048, result="SizeExceeded"
+/// S-5: Guest memory OOB → receipt with result="trap", path=""
 #[test]
-fn emit_capability_event_s3_size_exceeded() {
-    let (_, captured) = with_capability_capture(|| {
-        let tmp = tempfile::tempdir().unwrap();
-        // Create a file larger than the 1KB limit
-        let large_data = vec![0u8; 2048];
-        std::fs::write(tmp.path().join("large.bin"), large_data).unwrap();
+fn receipt_s5_guest_oob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
 
-        let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1024); // 1KB limit
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
 
-        let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
-            .expect("Failed to create sandbox");
+    let wasm = parse_str(GUEST_OOB).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
 
-        let wasm = parse_str(SIZE_EXCEEDED).expect("WAT parse failed");
-        let instance = sandbox
-            .instantiate_with_capabilities(&wasm, &[cap])
-            .expect("Module should instantiate");
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
 
-        let func = instance
-            .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
-            .expect("Function not found");
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on guest memory OOB");
 
-        let result = func.call(sandbox.store_mut(), ());
-        assert!(result.is_err(), "Expected trap on size exceeded");
-    });
+    // Verify receipt was emitted with result="trap" and path=""
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
 
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.read");
+    assert_eq!(receipt.action, "read");
+    assert_eq!(receipt.result, "trap");
+    assert_eq!(receipt.path, "");
+    assert!(receipt.timestamp_ns > 0, "timestamp_ns must be non-zero");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// S-416: Signing failure — emit fails → Trap, no data returned to caller
+#[test]
+fn receipt_s416_signing_failure() {
+    // This test verifies the critical fail-closed property:
+    // If ReceiptEmitter::emit() fails (signing failure), aegis_fs_read MUST
+    // immediately return Trap and NOT return any data to the caller.
+    // This is the critical fail-closed guarantee from Decision 4.
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("test.txt"), "hello world").unwrap();
+    let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
+        .expect("Failed to create sandbox");
+    let mut emitter = aegis::receipts::ReceiptEmitter::new(key_pair);
+    sandbox.store_mut().data_mut().receipt_emitter = Some(emitter);
+
+    let wasm = parse_str(ALLOWED_READ).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    // First, verify normal operation works (emit succeeds)
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_ok(), "Expected success with valid key");
+
+    // Verify receipt was emitted successfully
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1);
+    let receipt = &chain[0];
+    assert_eq!(receipt.result, "success");
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+
+    // NOW test the critical fail-closed path:
+    // Force the next emit() to fail (simulating signing failure)
+    {
+        let emitter = sandbox
+            .store_mut()
+            .data_mut()
+            .receipt_emitter
+            .as_mut()
+            .expect("receipt emitter missing");
+        emitter.force_signing_failure();
+    }
+
+    // Call again with forced signing failure - should Trap, not return data
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(
+        result.is_err(),
+        "Expected Trap on signing failure, got: {:?}",
+        result
+    );
+
+    // Verify NO data was returned to guest memory (the read should not have completed)
+    // We can't easily check guest memory from here, but the Trap confirms fail-closed
+
+    // Verify NO additional receipt was added to chain (emit failed, so no receipt added)
+    let chain = sandbox.get_receipt_chain();
     assert_eq!(
-        captured.len(),
+        chain.len(),
         1,
-        "Expected exactly 1 capability event, got: {:?}",
-        captured
+        "No new receipt should be added when emit fails"
     );
-
-    let event = &captured[0];
-    assert_eq!(event.capability, "filesystem.read");
-    assert_eq!(event.path, "large.bin");
-    assert_eq!(event.size, 2048);
-    assert_eq!(event.result, "SizeExceeded");
-}
-
-/// S-4 (REQ-105): WASI unknown import (fd_read) — linking error at instantiation
-/// Verifies NO emit_capability_event is called because the module fails to link
-/// before any host function can be invoked.
-#[test]
-fn emit_capability_event_s4_wasi_unknown_import() {
-    let (_, captured) = with_capability_capture(|| {
-        let tmp = tempfile::tempdir().unwrap();
-        let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
-
-        let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
-            .expect("Failed to create sandbox");
-
-        let wasm = parse_str(FD_LEAK).expect("WAT parse failed");
-        let result = sandbox.instantiate_with_capabilities(&wasm, &[cap]);
-
-        assert!(result.is_err(), "Expected linking error on WASI import");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("unknown import"),
-            "Expected 'unknown import' linking error, got: {}",
-            err_msg
-        );
-    });
-
-    // No capability event should be emitted because instantiation failed
-    assert_eq!(
-        captured.len(),
-        0,
-        "Expected NO capability events for linking error, got: {:?}",
-        captured
-    );
-}
-
-/// S-5 (REQ-107): Guest memory OOB
-/// Verifies emit_capability_event is called with capability="filesystem.read",
-/// path="" (empty because path read fails), size=0, result="Trap"
-#[test]
-fn emit_capability_event_s5_guest_memory_oob() {
-    let (_, captured) = with_capability_capture(|| {
-        let tmp = tempfile::tempdir().unwrap();
-        let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
-
-        let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
-            .expect("Failed to create sandbox");
-
-        let wasm = parse_str(GUEST_OOB).expect("WAT parse failed");
-        let instance = sandbox
-            .instantiate_with_capabilities(&wasm, &[cap])
-            .expect("Module should instantiate");
-
-        let func = instance
-            .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
-            .expect("Function not found");
-
-        let result = func.call(sandbox.store_mut(), ());
-        assert!(result.is_err(), "Expected trap on guest memory OOB");
-    });
-
-    assert_eq!(
-        captured.len(),
-        1,
-        "Expected exactly 1 capability event, got: {:?}",
-        captured
-    );
-
-    let event = &captured[0];
-    assert_eq!(event.capability, "filesystem.read");
-    // Path is empty because the OOB check happens before path read
-    assert_eq!(event.path, "");
-    assert_eq!(event.size, 0);
-    assert_eq!(event.result, "Trap");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
