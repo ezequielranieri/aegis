@@ -13,6 +13,14 @@ use serde::de::Error as SerdeError;
 #[derive(Debug, serde::Deserialize)]
 pub struct PolicyConfig {
     pub capabilities: Vec<CapabilityDef>,
+    #[serde(default)]
+    pub receipts: Option<ReceiptsConfig>,
+}
+
+/// Receipt signing configuration (REQ-421)
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReceiptsConfig {
+    pub key_path: PathBuf,
 }
 
 /// Capability definition from TOML — uses `serde(tag = "name")` for

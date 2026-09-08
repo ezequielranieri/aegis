@@ -1,6 +1,5 @@
 //! Declarative policy engine
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -48,19 +47,27 @@ impl PolicyEngine {
         Self { policy }
     }
 
-    pub fn evaluate(&self, capability: &str, context: &HashMap<String, serde_json::Value>) -> PolicyEffect {
+    pub fn evaluate(
+        &self,
+        capability: &str,
+        context: &HashMap<String, serde_json::Value>,
+    ) -> PolicyEffect {
         // Find matching rules (first match wins)
         for rule in &self.policy.rules {
-            if rule.capability == capability || rule.capability == "*" {
-                if self.matches_conditions(&rule.conditions, context) {
-                    return rule.effect.clone();
-                }
+            if (rule.capability == capability || rule.capability == "*")
+                && self.matches_conditions(&rule.conditions, context)
+            {
+                return rule.effect.clone();
             }
         }
         self.policy.default_effect.clone()
     }
 
-    fn matches_conditions(&self, conditions: &HashMap<String, serde_json::Value>, context: &HashMap<String, serde_json::Value>) -> bool {
+    fn matches_conditions(
+        &self,
+        conditions: &HashMap<String, serde_json::Value>,
+        context: &HashMap<String, serde_json::Value>,
+    ) -> bool {
         for (key, expected) in conditions {
             match context.get(key) {
                 Some(actual) if actual == expected => continue,

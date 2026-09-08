@@ -14,8 +14,10 @@ pub mod policy;
 pub mod receipts;
 pub mod sandbox;
 
-pub use config::{CapabilityDef, ConfigError, PolicyConfig};
-pub use sandbox::{CapabilityConfig, EpochInterrupter, Sandbox, SandboxConfig};
+pub use config::{CapabilityDef, ConfigError, PolicyConfig, ReceiptsConfig};
+pub use sandbox::{
+    load_receipt_keypair, CapabilityConfig, EpochInterrupter, Sandbox, SandboxConfig,
+};
 
 /// Initialize the Aegis runtime
 pub async fn initialize() -> anyhow::Result<()> {
