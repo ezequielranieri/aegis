@@ -43,6 +43,7 @@ impl AegisRuntime for AegisRuntimeService {
         let req = request.into_inner();
         let capability_name = req.capability_name;
         let config_bytes = req.config;
+        let wasm_module_bytes = req.wasm_module;
 
         tracing::info!(capability = %capability_name, "execute request received");
 
@@ -63,17 +64,22 @@ impl AegisRuntime for AegisRuntimeService {
             .try_into_capabilities()
             .map_err(|e| Status::invalid_argument(format!("invalid capabilities: {}", e)))?;
 
-        // 3. Create sandbox for this request
+        // 3. Validate WASM module provided
+        if wasm_module_bytes.is_empty() {
+            return Err(Status::invalid_argument("wasm_module is required"));
+        }
+
+        // 4. Create sandbox for this request
         let mut sandbox = Sandbox::new_with_limits(SandboxConfig::default()).map_err(|e| {
             tracing::error!(error = %e, "failed to create sandbox");
             Status::internal(format!("failed to create sandbox: {}", e))
         })?;
 
-        // 4. Set the shared receipt emitter on the sandbox
+        // 5. Set the shared receipt emitter on the sandbox
         sandbox.store_mut().data_mut().receipt_emitter =
             Some(self.receipt_emitter.clone());
 
-        // 5. Find the matching capability by name
+        // 6. Find the matching capability by name
         let matching_cap = capabilities
             .iter()
             .find(|c| c.capability_name() == capability_name)
@@ -84,21 +90,14 @@ impl AegisRuntime for AegisRuntimeService {
                 ))
             })?;
 
-        // 6. Execute the capability in the sandbox
-        let result = match capability_name.as_str() {
-            "filesystem.read" => {
-                self.execute_filesystem_read(&mut sandbox, matching_cap, &config_str)
-                    .await
-            }
-            _ => Err(Status::unimplemented(format!(
-                "capability '{}' not yet implemented",
-                capability_name
-            ))),
-        };
+        // 7. Execute the capability in the sandbox via WASM
+        let result = self
+            .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
+            .await;
 
         match result {
             Ok(output) => {
-                // 7. Emit a success receipt for this execution
+                // 8. Emit a success receipt for this execution
                 {
                     let mut emitter = self.receipt_emitter.lock().map_err(|e| {
                         Status::internal(format!("receipt emitter lock failed: {}", e))
@@ -108,7 +107,7 @@ impl AegisRuntime for AegisRuntimeService {
                         .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?;
                 }
 
-                // 8. Get the receipt from the emitter chain
+                // 9. Get the receipt from the emitter chain
                 let receipt_json = {
                     let emitter = self.receipt_emitter.lock().map_err(|e| {
                         Status::internal(format!("receipt emitter lock failed: {}", e))
@@ -212,7 +211,7 @@ impl AegisRuntime for AegisRuntimeService {
 
         tracing::info!(count = receipts.len(), "returning receipt chain");
 
-Ok(Response::new(GetReceiptChainResponse {
+        Ok(Response::new(GetReceiptChainResponse {
             receipts,
         }))
     }
@@ -220,24 +219,53 @@ Ok(Response::new(GetReceiptChainResponse {
 
 #[allow(clippy::result_large_err)]
 impl AegisRuntimeService {
-    async fn execute_filesystem_read(
+    /// Execute a capability by instantiating the provided WASM module with the granted capabilities
+    /// and calling its exported `execute` function.
+    async fn execute_wasm_capability(
         &self,
-        _sandbox: &mut Sandbox,
-        cap: &crate::capabilities::Capability,
-        config_str: &str,
+        sandbox: &mut Sandbox,
+        capabilities: &[crate::capabilities::Capability],
+        wasm_module_bytes: &[u8],
     ) -> Result<Vec<u8>, Status> {
-        // Parse the config to get the path to read
-        let _policy_config: crate::config::PolicyConfig = toml::from_str(config_str)
-            .map_err(|e| Status::invalid_argument(format!("config parse error: {}", e)))?;
+        // Instantiate the WASM module with the granted capabilities
+        let instance = sandbox
+            .instantiate_with_capabilities(wasm_module_bytes, capabilities)
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to instantiate WASM module");
+                Status::internal(format!("WASM instantiation failed: {}", e))
+            })?;
 
-        // For now, we return a simple success indicator
-        // In a full implementation, this would load a WASM module and execute it
-        // with the filesystem.read capability registered via Linker
-        let result = format!(
-            "filesystem.read executed for capability: {}",
-            cap.capability_name()
-        );
+        // Get the exported `execute` function
+        let execute_func = instance
+            .get_typed_func::<(), (i32,)>(&mut sandbox.store_mut(), "execute")
+            .map_err(|e| {
+                tracing::error!(error = %e, "exported function 'execute' not found");
+                Status::failed_precondition(format!("WASM module must export 'execute' function: {}", e))
+            })?;
 
-        Ok(result.into_bytes())
+        // Call the execute function (no arguments, returns i32 status/result pointer)
+        let (result_ptr,) = execute_func
+            .call_async(&mut sandbox.store_mut(), ())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "WASM execution trapped");
+                // WASM trap = capability violation or guest error
+                Status::failed_precondition(format!("WASM execution trapped: {}", e))
+            })?;
+
+        // Get memory export from the instance
+        let memory = instance
+            .get_export(&mut sandbox.store_mut(), "memory")
+            .and_then(|e| e.into_memory())
+            .ok_or_else(|| Status::internal("memory export required"))?;
+
+        // For now, return a simple success indicator
+        // TODO: Implement proper result retrieval from guest memory using result_ptr
+        // The WASM module should write results to a known memory location
+        // or use a host function to return data
+        let _ = memory; // suppress unused warning
+        let _ = result_ptr;
+
+        Ok(b"WASM execution completed".to_vec())
     }
 }

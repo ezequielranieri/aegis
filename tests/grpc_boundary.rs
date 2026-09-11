@@ -209,6 +209,7 @@ fn execute_request(capability_name: &str, config_bytes: Vec<u8>) -> ExecuteReque
     ExecuteRequest {
         capability_name: capability_name.into(),
         config: config_bytes,
+        wasm_module: vec![], // Empty - tests are @ignore anyway, real tests would need a valid WASM module
     }
 }
 
