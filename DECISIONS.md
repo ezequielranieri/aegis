@@ -282,3 +282,68 @@ Create a hardening PR (`hardening/grpc-boundary-tests`) with tasks:
 - Design: `openspec/changes/phase5-agent-gateway-integration/design.md` Testing Strategy §3.4
 - Phase: 5 (agent-gateway integration)
 - **Mandatory next task**: `hardening/grpc-boundary-tests` PR (blocks Phase 6+)
+
+---
+## AD-008: Execute RPC Stub — Phase 5 Closure Invalidated
+
+**Date**: 2026-09-11
+**Phase**: 5 (agent-gateway integration)
+**Status**: Accepted (Retroactive Invalidation)
+
+### Context
+Phase 5 was declared **CLOSED** twice with a verify pass reporting "36/36 requirements, 28/28 scenarios PASS" — including REQ-714 ("Execute RPC SHALL create a sandbox per request from the provided config and run the capability") and REQ-715 ("Execute RPC SHALL trap and return success=false on any violation").
+
+**Subsequent investigation revealed the Execute RPC handler never loads or executes a WASM module.** The implementation in `src/grpc/handlers/mod.rs`:
+
+1. Creates a sandbox ✅
+2. Parses config and validates capability grant ✅
+3. Sets shared ReceiptEmitter on sandbox ✅
+4. **Does NOT call `instantiate_with_capabilities(wasm_bytes, capabilities)`** ❌
+5. **Does NOT invoke any exported function from an instantiated module** ❌
+6. Returns a hardcoded success string via `execute_filesystem_read` stub ❌
+
+The stub (lines 223-242) explicitly documents this:
+```rust
+// For now, we return a simple success indicator
+// In a full implementation, this would load a WASM module and execute it
+// with the filesystem.read capability registered via Linker
+let result = format!("filesystem.read executed for capability: {}", cap.capability_name());
+```
+
+### Decision
+**Phase 5 closure is retroactively invalidated.** The verify PASS did not reflect reality — no verify step exercised actual capability execution via wasmtime. Phase 5 remains **OPEN** until:
+
+1. Execute RPC loads a WASM module (source TBD: embedded, config-specified, or uploaded)
+2. Execute RPC calls `sandbox.instantiate_with_capabilities(wasm_bytes, capabilities)`
+3. Execute RPC invokes the module's exported entry point (e.g., `run`, `execute`)
+4. Execute RPC captures actual result (not hardcoded string) and emits receipt based on real execution
+5. All S-700..S-715 scenarios verified against real execution (not stub)
+
+### Consequences
+- **`hardening/grpc-boundary-tests` PR is BLOCKED** — its S-701, S-702, S-721 tests are `@ignore` precisely because Execute doesn't execute. They cannot pass until this is fixed.
+- **All Phase 5 "CLOSED" claims are retracted** — no archive, no delivery, no Phase 6 start.
+- **Verify process reliability in question** — this is the second retroactive invalidation in Phase 5 (build declared closed while broken; verify PASS without real execution). Future verify runs must include manual spot-check of critical paths.
+
+### Root Cause
+Verify relied on artifact existence and compile success, not behavioral validation of the core runtime loop (WASM load → instantiate → execute → receipt). The `execute_filesystem_read` stub was written with a TODO comment but never flagged as blocking verification.
+
+### Traceability
+| Spec Requirement | Status | Evidence |
+|-----------------|--------|----------|
+| REQ-714 (Execute runs capability) | **NOT MET** | Stub returns hardcoded string |
+| REQ-715 (Execute traps on violation) | **NOT MET** | No sandbox execution = no violation possible |
+| S-700 (Execute happy path) | **UNTESTABLE** | Requires real WASM execution |
+| S-701 (Execute violation trap) | **UNTESTABLE** | Currently `@ignore` in hardening tests |
+| S-702 (Execute signing failure) | **UNTESTABLE** | Currently `@ignore` in hardening tests |
+| S-721 (Execute corrupt key) | **UNTESTABLE** | Currently `@ignore` in hardening tests |
+
+### Follow-up
+New branch `fix/execute-wasmtime-wiring` to implement real Execute:
+1. Determine WASM module source (embedded test module? config path? upload via gRPC?)
+2. Add `wasm_module_path` or similar to `ExecuteRequest` / `RuntimeConfig`
+3. In Execute handler: load module → `instantiate_with_capabilities` → call export → capture result
+4. Remove `execute_filesystem_read` stub
+5. Re-enable `@ignore` tests in `hardening/grpc-boundary-tests`
+6. Re-run full verify for Phase 5
+
+**Owner**: ez (assigned). **Target**: before any Phase 5 archive or Phase 6 work.
