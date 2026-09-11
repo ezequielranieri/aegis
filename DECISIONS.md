@@ -410,4 +410,11 @@ Create `AD-009` to track this. The hardening PR `hardening/grpc-boundary-tests` 
 | REQ-708 (ExecuteResponse contains result) | **MET** | Returns actual guest output bytes |
 | S-700 (Execute happy path) | **MET** | Receipt has real hash, path, size |
 
-**AD-009 STATUS: RESOLVED** — Happy path receipt integrity gap closed. Ready for Phase 5 verify + archive.
+### Tests Added (2026-09-11)
+| Test | Verifies |
+|------|----------|
+| `execute_rpc_happy_path_result_capture` | ExecuteResponse.result = guest bytes; receipt result = BLAKE3 hash; path = config; size = bytes |
+| `get_receipt_chain_returns_chain` | Chain has 4 receipts (2 read + 2 execute) after 2 Execute calls |
+| `verify_chain_valid_via_grpc` | GetReceiptChain chain passes VerifyChain with valid=true |
+
+**AD-009 STATUS: RESOLVED** — Happy path receipt integrity gap closed. All 90 tests pass. Ready for Phase 5 verify + archive.
