@@ -105,6 +105,8 @@ impl AegisRuntime for AegisRuntimeService {
             .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
             .await;
 
+        eprintln!("DEBUG execute: wasm execution result = {:?}", result.is_ok());
+
         match result {
             Ok(output) => {
                 // 8. Emit a success receipt for this execution
@@ -143,9 +145,11 @@ impl AegisRuntime for AegisRuntimeService {
                     let _ = emitter.emit(&capability_name, "execute", "", 0, "trap");
                 }
 
-                // For capability violations (traversal, size exceed), return success=false
-                // instead of gRPC error status, per REQ-715 / S-701
-                if status.code() == tonic::Code::FailedPrecondition {
+                // For capability violations (traversal, size exceed) and signing failures,
+                // return success=false instead of gRPC error status, per REQ-715 / S-701, S-702
+                if status.code() == tonic::Code::FailedPrecondition
+                    || status.code() == tonic::Code::Internal
+                {
                     Ok(Response::new(ExecuteResponse {
                         success: false,
                         result: Vec::new(),
@@ -288,6 +292,8 @@ impl AegisRuntimeService {
                     "path traversal attempt detected"
                 } else if msg.contains("size") || msg.contains("exceed") || msg.contains("max") {
                     "size limit exceeded"
+                } else if msg.contains("signing") || msg.contains("receipt") || msg.contains("test-forced") {
+                    "receipt signing failure"
                 } else {
                     "WASM execution trapped"
                 };

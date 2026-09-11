@@ -7,6 +7,7 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -21,12 +22,12 @@ use tonic::transport::{Certificate as TonicCertificate, Channel, ClientTlsConfig
 use tonic::Request;
 
 use aegis::config::runtime::{RuntimeConfig, ServerConfig, TlsConfig, ReceiptsConfig, ExecutionConfig};
-use aegis::grpc::server::start_server_internal;
+use aegis::grpc::server::{start_server_internal, start_server_internal_with_emitter};
 use aegis::proto::aegis::v1::{
     aegis_runtime_client::AegisRuntimeClient,
     ExecuteRequest, VerifyChainRequest,
 };
-use aegis::receipts::ExecutionReceipt;
+use aegis::receipts::{ExecutionReceipt, ReceiptEmitter};
 use aegis::sandbox::load_receipt_keypair;
 
 /// Enable test mode for the gRPC handler (disables epoch interruption)
@@ -208,16 +209,20 @@ private_key = "{}"
     fn signing_key_path(&self) -> PathBuf { self.temp_dir.path().join("signing_key.toml") }
 }
 
-/// Test server handle with address and shutdown
+/// Test server handle with address, shutdown, and ReceiptEmitter reference
 struct TestServer {
     addr: std::net::SocketAddr,
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _handle: JoinHandle<anyhow::Result<std::net::SocketAddr>>,
+    /// Shared ReceiptEmitter for test-only operations (e.g., force_signing_failure)
+    receipt_emitter: Arc<StdMutex<ReceiptEmitter>>,
 }
 
 impl TestServer {
     /// Start a test gRPC server on a fixed port with mTLS
+    /// Creates the ReceiptEmitter internally (production-like path).
     async fn start(config: RuntimeConfig) -> Result<Self> {
+        let key_path = config.receipts.key_path.clone();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let port = config.server.port;
 
@@ -236,14 +241,65 @@ impl TestServer {
         // Wait a bit for server to start
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // We can't get the emitter back from start_server_internal, so we create a dummy
+        // For tests that need the emitter, use `start_with_emitter` instead
+        let key_pair = load_receipt_keypair(&key_path)
+            .map_err(|e| anyhow::anyhow!("failed to load receipt key: {}", e))?;
+        let receipt_emitter = Arc::new(StdMutex::new(ReceiptEmitter::new(key_pair)));
+
         Ok(Self {
             addr,
             _shutdown: shutdown_tx,
             _handle: handle,
+            receipt_emitter,
         })
     }
 
+    /// Start a test gRPC server with a pre-created ReceiptEmitter.
+    /// Returns the TestServer AND retains the emitter for test-only operations.
+    async fn start_with_emitter(config: RuntimeConfig) -> Result<(Self, Arc<StdMutex<ReceiptEmitter>>)> {
+        let key_path = config.receipts.key_path.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let port = config.server.port;
+
+        // Construct proper SocketAddr
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+
+        // Create the emitter upfront
+        let key_pair = load_receipt_keypair(&key_path)
+            .map_err(|e| anyhow::anyhow!("failed to load receipt key: {}", e))?;
+        let receipt_emitter = Arc::new(StdMutex::new(ReceiptEmitter::new(key_pair)));
+        let emitter_for_server = Arc::clone(&receipt_emitter);
+
+        // Wrap shutdown_rx in a future that resolves to ()
+        let shutdown_fut = async move {
+            let _ = shutdown_rx.await;
+        };
+
+        let handle = tokio::spawn(async move {
+            start_server_internal_with_emitter(&config, addr, shutdown_fut, emitter_for_server).await
+        });
+
+        // Wait a bit for server to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        Ok((
+            Self {
+                addr,
+                _shutdown: shutdown_tx,
+                _handle: handle,
+                receipt_emitter: Arc::clone(&receipt_emitter),
+            },
+            receipt_emitter,
+        ))
+    }
+
     fn addr(&self) -> SocketAddr { self.addr }
+    
+    /// Get a reference to the shared ReceiptEmitter for test-only operations.
+    fn emitter(&self) -> &Arc<StdMutex<ReceiptEmitter>> {
+        &self.receipt_emitter
+    }
 }
 
 /// Create a test gRPC client with mTLS configured
@@ -412,9 +468,12 @@ async fn execute_rpc_signing_failure_via_grpc() -> Result<()> {
     std::fs::write(&safe_file, "safe content")?;
     let allowed_root = test_root.path().to_str().unwrap().to_string();
 
-    // Start server on a fixed port for this test
+    // Enable test mode to disable epoch interruption
+    enable_test_mode();
+
+    // Start server on a fixed port for this test, retaining the emitter
     let config = create_test_config(&certs, 50053);
-    let server = TestServer::start(config).await?;
+    let (server, emitter) = TestServer::start_with_emitter(config).await?;
     let addr = server.addr();
 
     // Create client with mTLS
@@ -423,27 +482,36 @@ async fn execute_rpc_signing_failure_via_grpc() -> Result<()> {
     // Execute a successful capability first
     let safe_config = filesystem_read_config(&allowed_root, 1024);
     let safe_wasm = wasm_test_modules::safe_read_module();
-    let req = execute_request("filesystem.read", safe_config, safe_wasm);
+    let req = execute_request("filesystem.read", safe_config.clone(), safe_wasm.clone());
 
     let resp = client.execute(Request::new(req)).await?;
     assert_eq!(resp.get_ref().success, true, "first execution should succeed");
 
     // Now force a signing failure on the shared ReceiptEmitter
-    // We need to access the server's ReceiptEmitter - for this test we use
-    // the fact that the test-utils feature exposes force_signing_failure
-    // Note: In a real test, we'd need a way to inject this. For now, we verify
-    // the error mapping by checking that a signing failure produces INTERNAL.
-    // This test demonstrates the expected behavior; actual injection requires
-    // test server access to the shared emitter.
-    //
-    // TODO: Add a test-only endpoint or mechanism to trigger force_signing_failure
-    // on the running server's ReceiptEmitter.
+    // This uses the test-only method exposed by the "test-utils" feature
+    {
+        let mut emitter_guard = emitter.lock().expect("emitter lock poisoned");
+        emitter_guard.force_signing_failure();
+    }
 
-    // For now, we verify the error path exists by checking the handler logic
-    // The test passes if the server is running and the first request succeeded
-    // (proving the execute path works), and we document the signing failure
-    // mapping expectation in the test name and comments.
+    // Second execution should fail with INTERNAL due to forced signing failure
+    let req2 = execute_request("filesystem.read", safe_config.clone(), safe_wasm.clone());
+    let resp2 = client.execute(Request::new(req2)).await?;
 
+    // The Execute handler should catch the signing error and return INTERNAL
+    // via gRPC success=false with error message
+    eprintln!("Actual error message: '{}'", resp2.get_ref().error_message);
+    assert_eq!(resp2.get_ref().success, false, "second execution should fail due to signing failure");
+    assert!(
+        resp2.get_ref().error_message.contains("signing") ||
+        resp2.get_ref().error_message.contains("receipt") ||
+        resp2.get_ref().error_message.contains("internal") ||
+        resp2.get_ref().error_message.contains("test-forced"),
+        "error should indicate signing failure: {}",
+        resp2.get_ref().error_message
+    );
+
+    // Shutdown server
     let _ = server._shutdown.send(());
 
     Ok(())

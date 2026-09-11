@@ -52,17 +52,48 @@ pub async fn start_server_internal(
     addr: SocketAddr,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<SocketAddr> {
-    // Ensure rustls crypto provider is installed (needed for tests)
+    // Create emitter internally (production path)
     let _ = rustls::crypto::ring::default_provider().install_default();
-    // 1. Load Ed25519 key pair (REQ-706, fail-closed)
     let key_pair = load_receipt_keypair(&config.receipts.key_path)
         .map_err(|e| anyhow::anyhow!("failed to load receipt key: {}", e))?;
 
     tracing::info!("receipt key loaded successfully");
 
-    // 2. Create shared ReceiptEmitter
     let receipt_emitter = Arc::new(Mutex::new(ReceiptEmitter::new(key_pair)));
 
+    start_server_with_emitter(config, addr, shutdown, receipt_emitter).await
+}
+
+/// Internal server startup that accepts a pre-created ReceiptEmitter.
+///
+/// Used by integration tests that need to retain a reference to the emitter
+/// for test-only operations like `force_signing_failure()`.
+#[doc(hidden)]
+pub async fn start_server_internal_with_emitter(
+    config: &RuntimeConfig,
+    addr: SocketAddr,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    receipt_emitter: Arc<Mutex<ReceiptEmitter>>,
+) -> anyhow::Result<SocketAddr> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    
+    // Validate that the emitter has a valid key (test only)
+    if config.receipts.key_path.exists() {
+        let _ = load_receipt_keypair(&config.receipts.key_path)
+            .map_err(|e| anyhow::anyhow!("failed to load receipt key: {}", e))?;
+        tracing::info!("receipt key loaded successfully (test mode with injected emitter)");
+    }
+
+    start_server_with_emitter(config, addr, shutdown, receipt_emitter).await
+}
+
+/// Common server startup logic shared by both entry points.
+async fn start_server_with_emitter(
+    config: &RuntimeConfig,
+    addr: SocketAddr,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    receipt_emitter: Arc<Mutex<ReceiptEmitter>>,
+) -> anyhow::Result<SocketAddr> {
     // 3. Create semaphore for concurrency limiting
     let _semaphore = Arc::new(Semaphore::new(config.execution.max_concurrent));
 
@@ -99,7 +130,7 @@ pub async fn start_server_internal(
         .await
         .map_err(|e| anyhow::anyhow!("gRPC server error: {}", e))?;
 
-    tracing::info!("gRPC server stopped");
+tracing::info!("gRPC server stopped");
     Ok(local_addr)
 }
 
