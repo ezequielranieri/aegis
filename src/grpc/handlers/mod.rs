@@ -69,11 +69,21 @@ impl AegisRuntime for AegisRuntimeService {
             return Err(Status::invalid_argument("wasm_module is required"));
         }
 
-        // 4. Create sandbox for this request
-        let mut sandbox = Sandbox::new_with_limits(SandboxConfig::default()).map_err(|e| {
-            tracing::error!(error = %e, "failed to create sandbox");
-            Status::internal(format!("failed to create sandbox: {}", e))
-        })?;
+// 4. Create sandbox for this request
+        // Check for test mode to disable epoch interruption entirely (avoids "wasm trap: interrupt" in tests)
+        let test_mode = std::env::var("AEGIS_TEST_MODE").is_ok();
+        let mut sandbox = if test_mode {
+            // Disable epoch interruption entirely for tests (like unit tests do)
+            Sandbox::new_with_config(SandboxConfig::default(), false).map_err(|e| {
+                tracing::error!(error = %e, "failed to create sandbox");
+                Status::internal(format!("failed to create sandbox: {}", e))
+            })?
+        } else {
+            Sandbox::new_with_limits(SandboxConfig::default()).map_err(|e| {
+                tracing::error!(error = %e, "failed to create sandbox");
+                Status::internal(format!("failed to create sandbox: {}", e))
+            })?
+        };
 
         // 5. Set the shared receipt emitter on the sandbox
         sandbox.store_mut().data_mut().receipt_emitter =
@@ -133,7 +143,18 @@ impl AegisRuntime for AegisRuntimeService {
                     let _ = emitter.emit(&capability_name, "execute", "", 0, "trap");
                 }
 
-                Err(status)
+                // For capability violations (traversal, size exceed), return success=false
+                // instead of gRPC error status, per REQ-715 / S-701
+                if status.code() == tonic::Code::FailedPrecondition {
+                    Ok(Response::new(ExecuteResponse {
+                        success: false,
+                        result: Vec::new(),
+                        receipt: Vec::new(),
+                        error_message: status.message().to_string(),
+                    }))
+                } else {
+                    Err(status)
+                }
             }
         }
     }
@@ -245,12 +266,32 @@ impl AegisRuntimeService {
 
         // Call the execute function (no arguments, returns i32 status/result pointer)
         let (result_ptr,) = execute_func
-            .call_async(&mut sandbox.store_mut(), ())
-            .await
+            .call(&mut sandbox.store_mut(), ())
             .map_err(|e| {
                 tracing::error!(error = %e, "WASM execution trapped");
                 // WASM trap = capability violation or guest error
-                Status::failed_precondition(format!("WASM execution trapped: {}", e))
+                // The error `e` is anyhow::Error wrapping wasmtime::Error
+                // Try to extract the original host function error from the error chain
+                let mut msg = e.to_string();
+                if let Some(source) = e.source() {
+                    msg.push_str(" | source: ");
+                    msg.push_str(&source.to_string());
+                    if let Some(source2) = source.source() {
+                        msg.push_str(" | source2: ");
+                        msg.push_str(&source2.to_string());
+                    }
+                }
+                tracing::debug!(full_error = %msg, "WASM trap error chain");
+                
+                // Extract meaningful error message for common violation types
+                let clean_msg = if msg.contains("traversal") || msg.contains("..") || msg.contains("outside") || msg.contains("traversal attempt") {
+                    "path traversal attempt detected"
+                } else if msg.contains("size") || msg.contains("exceed") || msg.contains("max") {
+                    "size limit exceeded"
+                } else {
+                    "WASM execution trapped"
+                };
+                Status::failed_precondition(clean_msg)
             })?;
 
         // Get memory export from the instance

@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -172,8 +173,9 @@ pub struct SandboxState {
     limits: StoreLimits,
     /// Capability configs captured for host function access during execution.
     capabilities: Vec<CapabilityConfig>,
-    /// Receipt emitter for signed execution receipts (Phase 3, REQ-430).
-    pub receipt_emitter: Option<ReceiptEmitter>,
+    /// Shared receipt emitter for signed execution receipts (Phase 5, REQ-430).
+    /// `Arc<Mutex<ReceiptEmitter>>` enables a single hash chain across concurrent gRPC RPCs.
+    pub receipt_emitter: Option<Arc<Mutex<ReceiptEmitter>>>,
 }
 
 /// Load an Ed25519 key pair from a TOML key file (REQ-420, REQ-423, REQ-424, REQ-426).
@@ -322,13 +324,13 @@ impl Sandbox {
     }
 
     /// Returns a reference to the receipt chain for verification/testing.
-    pub fn get_receipt_chain(&self) -> &[ExecutionReceipt] {
+    pub fn get_receipt_chain(&self) -> Vec<ExecutionReceipt> {
         self.store
             .data()
             .receipt_emitter
             .as_ref()
-            .expect("ReceiptEmitter not initialized")
-            .chain()
+            .map(|e| e.lock().unwrap().chain().to_vec())
+            .unwrap_or_default()
     }
 
     /// Instantiates a WASM module in the sandbox.
@@ -451,7 +453,7 @@ impl Sandbox {
             let key_pair = load_receipt_keypair(&receipts_config.key_path)
                 .map_err(|e| anyhow::anyhow!("receipts key load failed: {}", e))?;
             let emitter = ReceiptEmitter::new(key_pair);
-            sandbox.store.data_mut().receipt_emitter = Some(emitter);
+            sandbox.store.data_mut().receipt_emitter = Some(Arc::new(Mutex::new(emitter)));
         }
 
         Ok(sandbox)
@@ -459,9 +461,8 @@ impl Sandbox {
 
     /// Access the receipt chain for verification and CLI export.
     ///
-    /// Returns a reference to the current public key bytes for external
-    /// chain verification (REQ-454).
-    pub fn get_receipt_emitter(&self) -> Option<&ReceiptEmitter> {
+    /// Returns a reference to the shared `Arc<Mutex<ReceiptEmitter>>`.
+    pub fn get_receipt_emitter(&self) -> Option<&Arc<Mutex<ReceiptEmitter>>> {
         self.store.data().receipt_emitter.as_ref()
     }
 }
@@ -509,8 +510,8 @@ fn aegis_fs_read(
 
     let path_bytes = path_result.ok_or_else(|| {
         // Guest memory OOB (S-5): emit receipt, then trap
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "read", "", 0, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "read", "", 0, "trap") {
                 return anyhow::anyhow!("receipt emission failed: {}", e);
             }
         }
@@ -523,8 +524,8 @@ fn aegis_fs_read(
 
     // 4. REQ-103: Reject .. segments BEFORE canonicalize (T-1, S-3)
     if path.contains("..") {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "read", &path, 0, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "read", &path, 0, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -538,8 +539,8 @@ fn aegis_fs_read(
     let canonical_root = std::fs::canonicalize(&cap.allowed_root)
         .map_err(|_| anyhow::anyhow!("allowed_root canonicalization failed"))?;
     if !canonical_path.starts_with(&canonical_root) {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "read", &path, 0, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "read", &path, 0, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -551,8 +552,8 @@ fn aegis_fs_read(
         .map_err(|_| anyhow::anyhow!("file metadata read failed"))?;
     let file_size = metadata.len();
     if file_size > cap.max_bytes {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "read", &path, file_size, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "read", &path, file_size, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -564,8 +565,8 @@ fn aegis_fs_read(
     }
 
     // 7. Emit receipt for happy path (S-1) BEFORE read
-    if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-        if let Err(e) = emitter.emit(&cap_name, "read", &path, file_size, "success") {
+    if let Some(ref emitter) = caller.data().receipt_emitter {
+        if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "read", &path, file_size, "success") {
             return Err(anyhow::anyhow!("receipt emission failed: {}", e));
         }
     }
@@ -631,8 +632,8 @@ fn aegis_fs_write(
 
     let path_bytes = path_result.ok_or_else(|| {
         // Guest memory OOB on path — emit trap receipt, then trap
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "write", "", 0, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "write", "", 0, "trap") {
                 return anyhow::anyhow!("receipt emission failed: {}", e);
             }
         }
@@ -645,8 +646,8 @@ fn aegis_fs_write(
 
     // 4. REQ-503: Reject .. segments BEFORE canonicalize (S-3-W)
     if path.contains("..") {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "write", &path, 0, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "write", &path, 0, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -680,8 +681,8 @@ fn aegis_fs_write(
                     // allowed_root via ".." is a traversal attempt regardless of whether the
                     // target exists yet.
                     if target.components().any(|c| c.as_os_str() == "..") {
-                        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-                            let _ = emitter.emit(&cap_name, "write", &path, 0, "trap");
+                        if let Some(ref emitter) = caller.data().receipt_emitter {
+                            let _ = emitter.lock().unwrap().emit(&cap_name, "write", &path, 0, "trap");
                         }
                         bail!("symlink target contains '..' traversal segment");
                     }
@@ -718,15 +719,15 @@ fn aegis_fs_write(
     // unresolved ".." that escaped the earlier checks, and any other path
     // construction that might leave ".." unnormalized.
     if canonical_path.components().any(|c| c.as_os_str() == "..") {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            let _ = emitter.emit(&cap_name, "write", &path, 0, "trap");
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            let _ = emitter.lock().unwrap().emit(&cap_name, "write", &path, 0, "trap");
         }
         bail!("path contains '..' after resolution — traversal attempt");
     }
 
     if !canonical_path.starts_with(&canonical_root) {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "write", &path, 0, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "write", &path, 0, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -741,8 +742,8 @@ fn aegis_fs_write(
     };
 
     let write_data = data_result.ok_or_else(|| {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "write", &path, 0, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "write", &path, 0, "trap") {
                 return anyhow::anyhow!("receipt emission failed: {}", e);
             }
         }
@@ -752,8 +753,8 @@ fn aegis_fs_write(
     // 7. REQ-504: Size enforcement (S-5-W)
     let data_size = write_data.len() as u64;
     if data_size > cap.max_bytes {
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "write", &path, data_size, "trap") {
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "write", &path, data_size, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -796,8 +797,8 @@ fn aegis_fs_write(
     if let Err(e) = std::fs::rename(&temp_path, &canonical_path) {
         // Rename failed — cleanup temp file, emit trap receipt, then trap
         let _ = std::fs::remove_file(&temp_path);
-        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            let _ = emitter.emit(&cap_name, "write", &path, data_size, "trap");
+        if let Some(ref emitter) = caller.data().receipt_emitter {
+            let _ = emitter.lock().unwrap().emit(&cap_name, "write", &path, data_size, "trap");
         }
         bail!("atomic rename failed: {}", e);
     }
@@ -807,8 +808,8 @@ fn aegis_fs_write(
     // In read, we could trap and not return data. In write, the file is ALREADY
     // written to the host filesystem and visible to other processes. We cannot
     // "un-write" it. If emit fails HERE, we have a real write without a receipt.
-    if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-        if let Err(e) = emitter.emit(&cap_name, "write", &path, data_size, "success") {
+    if let Some(ref emitter) = caller.data().receipt_emitter {
+        if let Err(e) = emitter.lock().unwrap().emit(&cap_name, "write", &path, data_size, "success") {
             // S-416-W-after-rename: emit failed AFTER successful rename
             // File is already written at target — we CANNOT undo it.
             tracing::error!(
