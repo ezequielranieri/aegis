@@ -296,9 +296,6 @@ impl AegisRuntimeService {
             .call(&mut sandbox.store_mut(), ())
             .map_err(|e| {
                 tracing::error!(error = %e, "WASM execution trapped");
-                // WASM trap = capability violation or guest error
-                // The error `e` is anyhow::Error wrapping wasmtime::Error
-                // Try to extract the original host function error from the error chain
                 let mut msg = e.to_string();
                 if let Some(source) = e.source() {
                     msg.push_str(" | source: ");
@@ -310,7 +307,6 @@ impl AegisRuntimeService {
                 }
                 tracing::debug!(full_error = %msg, "WASM trap error chain");
                 
-                // Extract meaningful error message for common violation types
                 let clean_msg = if msg.contains("traversal") || msg.contains("..") || msg.contains("outside") || msg.contains("traversal attempt") {
                     "path traversal attempt detected"
                 } else if msg.contains("size") || msg.contains("exceed") || msg.contains("max") {
@@ -322,6 +318,8 @@ impl AegisRuntimeService {
                 };
                 Status::failed_precondition(clean_msg)
             })?;
+
+        eprintln!("DEBUG execute_wasm: ptr={}, len={}", ptr, len);
 
         // Validate ptr/len
         if len < 0 || ptr < 0 {
