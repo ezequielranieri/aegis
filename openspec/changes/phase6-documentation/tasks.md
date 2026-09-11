@@ -37,6 +37,7 @@ Chain strategy: pending
 - [ ] 1.8 Create `openspec/changes/archive/2026-09-11-phase6-documentation/retrospective.md` with 3 false PASSes pattern analysis, AD-005 precedent, patterns that worked, and patterns needing correction
 - [ ] 1.9 Create `openspec/changes/archive/2026-09-11-phase6-documentation/archive-report.md` documenting completion of Phase 6 documentation artifacts
 - [ ] 1.10 Copy `openspec/changes/phase6-documentation/explore.md` into the archive folder as `openspec/changes/archive/2026-09-11-phase6-documentation/explore.md`
+- [ ] 1.11 Copy `openspec/changes/phase6-documentation/proposal.md` into the archive folder as `openspec/changes/archive/2026-09-11-phase6-documentation/proposal.md`
 
 ## Phase 2: Verify DECISIONS.md Completeness
 
