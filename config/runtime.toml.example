@@ -1,0 +1,25 @@
+# Aegis Runtime Configuration
+# Copy this file and adjust values for your environment.
+
+[server]
+host = "0.0.0.0"
+port = 50051
+
+# mTLS configuration (REQ-713, REQ-716)
+# When present, mutual TLS is required — clients must present a valid
+# certificate signed by the configured CA.
+[server.tls]
+cert_path = "/etc/aegis/server.crt"
+key_path = "/etc/aegis/server.key"
+ca_cert_path = "/etc/aegis/ca.crt"
+expected_identity = "agent-gateway"
+
+# Ed25519 signing key for execution receipts (REQ-706)
+[receipts]
+key_path = "/etc/aegis/signing_key.toml"
+
+# Concurrency limiting (REQ-810)
+# Max concurrent Execute RPCs. When the limit is reached,
+# subsequent requests receive RESOURCE_EXHAUSTED.
+[execution]
+max_concurrent = 8

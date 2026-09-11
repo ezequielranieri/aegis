@@ -1,0 +1,4 @@
+[[capabilities]]
+name = "filesystem.write"
+allowed_root = "/tmp/aegis-test-write"
+max_write_bytes = 1048576

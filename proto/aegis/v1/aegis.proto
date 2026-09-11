@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package aegis.v1;
+
+service AegisRuntime {
+  // Execute a capability and return result + signed receipt
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Verify a chain of receipts against a public key
+  rpc VerifyChain(VerifyChainRequest) returns (VerifyChainResponse);
+
+  // Get the current receipt chain from the runtime
+  rpc GetReceiptChain(GetReceiptChainRequest) returns (GetReceiptChainResponse);
+}
+
+service Health {
+  // Standard gRPC health check
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+}
+
+message ExecuteRequest {
+  string capability_name = 1;
+  bytes config = 2;
+}
+
+message ExecuteResponse {
+  bool success = 1;
+  bytes result = 2;
+  bytes receipt = 3;
+  string error_message = 4;
+}
+
+message VerifyChainRequest {
+  repeated bytes receipts = 1;
+  bytes public_key = 2;
+}
+
+message VerifyChainResponse {
+  bool valid = 1;
+  string error_message = 2;
+}
+
+message GetReceiptChainRequest {
+}
+
+message GetReceiptChainResponse {
+  repeated bytes receipts = 1;
+}
+
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+    SERVICE_UNKNOWN = 3;
+  }
+  ServingStatus status = 1;
+}
