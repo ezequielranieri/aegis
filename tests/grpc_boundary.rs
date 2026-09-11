@@ -40,6 +40,7 @@ mod wasm_test_modules {
     use wat;
 
     /// Safe filesystem.read module - reads a valid file within allowed_root
+    /// Returns (ptr, len) of the content read by fs_read
     /// Only imports fs_read since config only grants filesystem.read
     pub fn safe_read_module() -> Vec<u8> {
         wat::parse_str(r#"
@@ -49,18 +50,25 @@ mod wasm_test_modules {
               (export "memory" (memory 0))
               (data (i32.const 0) "safe_file.txt\00")
               (data (i32.const 16) "output_buffer\00")
-              (func $execute (export "execute") (result i32)
+              (func $execute (export "execute") (result i32 i32)
+                (local $bytes_read i32)
+                ;; Call fs_read to read file into output_buffer
                 i32.const 0    ;; path_ptr
-                i32.const 13   ;; path_len
+                i32.const 13   ;; path_len ("safe_file.txt")
                 i32.const 16   ;; out_ptr
                 i32.const 100  ;; out_len
-                call $fs_read
+                call $fs_read  ;; stack = [bytes_read]
+                local.set $bytes_read
+                ;; Return (ptr, len) = (out_ptr, bytes_read)
+                i32.const 16   ;; ptr = out_ptr
+                local.get $bytes_read
               )
             )
         "#).expect("valid WAT")
     }
 
     /// Path traversal module - attempts to read ../../../etc/passwd
+    /// fs_read will trap before returning, so execute never returns normally
     /// Only imports fs_read since config only grants filesystem.read
     pub fn traversal_read_module() -> Vec<u8> {
         wat::parse_str(r#"
@@ -70,18 +78,21 @@ mod wasm_test_modules {
               (export "memory" (memory 0))
               (data (i32.const 0) "../../../etc/passwd\00")
               (data (i32.const 16) "output_buffer\00")
-              (func $execute (export "execute") (result i32)
+              (func $execute (export "execute") (result i32 i32)
                 i32.const 0    ;; path_ptr
-                i32.const 16   ;; path_len ( "../../../etc/passwd" = 16 chars)
+                i32.const 16   ;; path_len ("../../../etc/passwd")
                 i32.const 16   ;; out_ptr
                 i32.const 100  ;; out_len
                 call $fs_read
+                ;; Never reached - fs_read traps on traversal
+                unreachable
               )
             )
         "#).expect("valid WAT")
     }
 
     /// Size exceed module - reads a file larger than max_read_bytes
+    /// fs_read will trap on size exceed, so execute never returns normally
     /// Only imports fs_read since config only grants filesystem.read
     pub fn size_exceed_read_module() -> Vec<u8> {
         wat::parse_str(r#"
@@ -91,12 +102,14 @@ mod wasm_test_modules {
               (export "memory" (memory 0))
               (data (i32.const 0) "large_file.txt\00")
               (data (i32.const 16) "output_buffer\00")
-              (func $execute (export "execute") (result i32)
+              (func $execute (export "execute") (result i32 i32)
                 i32.const 0    ;; path_ptr
-                i32.const 14   ;; path_len
+                i32.const 14   ;; path_len ("large_file.txt")
                 i32.const 16   ;; out_ptr
                 i32.const 100  ;; out_len
                 call $fs_read
+                ;; Never reached - fs_read traps on size exceed
+                unreachable
               )
             )
         "#).expect("valid WAT")

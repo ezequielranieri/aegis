@@ -5,6 +5,7 @@
 
 pub mod health;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Semaphore;
@@ -17,6 +18,7 @@ use crate::proto::aegis::v1::{
 };
 use crate::receipts::{ExecutionReceipt, ReceiptChain, ReceiptEmitter};
 use crate::sandbox::{Sandbox, SandboxConfig};
+use crate::capabilities::Capability;
 
 /// Shared state for all AegisRuntime RPC handlers.
 pub struct AegisRuntimeService {
@@ -101,21 +103,31 @@ impl AegisRuntime for AegisRuntimeService {
             })?;
 
         // 7. Execute the capability in the sandbox via WASM
-        let result = self
+        let result_bytes = self
             .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
             .await;
 
-        eprintln!("DEBUG execute: wasm execution result = {:?}", result.is_ok());
+        eprintln!("DEBUG execute: wasm execution result = {:?}", result_bytes);
 
-        match result {
-            Ok(output) => {
+        match result_bytes {
+            Ok(result_bytes) => {
+                // Calculate BLAKE3 hash for receipt
+                let result_hash = blake3::hash(&result_bytes).to_hex().to_string();
+
+                // Extract path from capability config for receipt
+                let capability_path = match &matching_cap {
+                    crate::capabilities::Capability::FilesystemRead(params) => params.allowed_root.to_string_lossy().to_string(),
+                    crate::capabilities::Capability::FilesystemWrite(params) => params.allowed_root.to_string_lossy().to_string(),
+                    crate::capabilities::Capability::NetworkHttp(_) => String::new(),
+                };
+
                 // 8. Emit a success receipt for this execution
                 {
                     let mut emitter = self.receipt_emitter.lock().map_err(|e| {
                         Status::internal(format!("receipt emitter lock failed: {}", e))
                     })?;
                     emitter
-                        .emit(&capability_name, "execute", "", output.len() as u64, "success")
+                        .emit(&capability_name, "execute", &capability_path, result_bytes.len() as u64, &result_hash)
                         .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?;
                 }
 
@@ -134,7 +146,7 @@ impl AegisRuntime for AegisRuntimeService {
 
                 Ok(Response::new(ExecuteResponse {
                     success: true,
-                    result: output,
+                    result: result_bytes,
                     receipt: receipt_bytes,
                     error_message: String::new(),
                 }))
@@ -256,20 +268,31 @@ impl AegisRuntimeService {
         let instance = sandbox
             .instantiate_with_capabilities(wasm_module_bytes, capabilities)
             .map_err(|e| {
+                // Print full error chain for debugging
+                let mut msg = e.to_string();
+                if let Some(source) = e.source() {
+                    msg.push_str(" | source: ");
+                    msg.push_str(&source.to_string());
+                    if let Some(source2) = source.source() {
+                        msg.push_str(" | source2: ");
+                        msg.push_str(&source2.to_string());
+                    }
+                }
+                eprintln!("DEBUG WASM instantiation error: {}", msg);
                 tracing::error!(error = %e, "failed to instantiate WASM module");
                 Status::internal(format!("WASM instantiation failed: {}", e))
             })?;
 
-        // Get the exported `execute` function
+        // Get the exported `execute` function - now returns (ptr, len)
         let execute_func = instance
-            .get_typed_func::<(), (i32,)>(&mut sandbox.store_mut(), "execute")
+            .get_typed_func::<(), (i32, i32)>(&mut sandbox.store_mut(), "execute")
             .map_err(|e| {
                 tracing::error!(error = %e, "exported function 'execute' not found");
-                Status::failed_precondition(format!("WASM module must export 'execute' function: {}", e))
+                Status::failed_precondition(format!("WASM module must export 'execute' function returning (ptr, len): {}", e))
             })?;
 
-        // Call the execute function (no arguments, returns i32 status/result pointer)
-        let (result_ptr,) = execute_func
+        // Call the execute function (no arguments, returns ptr and len)
+        let (ptr, len) = execute_func
             .call(&mut sandbox.store_mut(), ())
             .map_err(|e| {
                 tracing::error!(error = %e, "WASM execution trapped");
@@ -300,19 +323,27 @@ impl AegisRuntimeService {
                 Status::failed_precondition(clean_msg)
             })?;
 
-        // Get memory export from the instance
+        // Validate ptr/len
+        if len < 0 || ptr < 0 {
+            return Err(Status::internal("invalid ptr/len from WASM module"));
+        }
+
+        // Get memory export from the instance (after call, store is free)
         let memory = instance
-            .get_export(&mut sandbox.store_mut(), "memory")
-            .and_then(|e| e.into_memory())
+            .get_memory(&mut sandbox.store_mut(), "memory")
             .ok_or_else(|| Status::internal("memory export required"))?;
 
-        // For now, return a simple success indicator
-        // TODO: Implement proper result retrieval from guest memory using result_ptr
-        // The WASM module should write results to a known memory location
-        // or use a host function to return data
-        let _ = memory; // suppress unused warning
-        let _ = result_ptr;
+        // Read result bytes from guest memory
+        let ptr = ptr as usize;
+        let len = len as usize;
+        // Get store reference once to avoid temporary borrow issue
+        let store = sandbox.store_mut();
+        let data = memory.data(store);
+        if ptr + len > data.len() {
+            return Err(Status::internal("WASM result ptr/len exceeds memory bounds"));
+        }
+        let result_bytes = data[ptr..ptr + len].to_vec();
 
-        Ok(b"WASM execution completed".to_vec())
+        Ok(result_bytes)
     }
 }
