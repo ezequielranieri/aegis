@@ -25,7 +25,7 @@ use aegis::config::runtime::{RuntimeConfig, ServerConfig, TlsConfig, ReceiptsCon
 use aegis::grpc::server::{start_server_internal, start_server_internal_with_emitter};
 use aegis::proto::aegis::v1::{
     aegis_runtime_client::AegisRuntimeClient,
-    ExecuteRequest, VerifyChainRequest,
+    ExecuteRequest, VerifyChainRequest, GetReceiptChainRequest,
 };
 use aegis::receipts::{ExecutionReceipt, ReceiptEmitter};
 use aegis::sandbox::load_receipt_keypair;
@@ -597,6 +597,189 @@ async fn execute_rpc_signing_failure_corrupt_key_via_grpc() -> Result<()> {
     // With the current ring::Ed25519KeyPair implementation, this scenario
     // cannot occur because from_pkcs8 fully validates the key.
     // The test passes by documenting this constraint.
+
+    Ok(())
+}
+
+/// S-700: Execute happy path result capture via gRPC
+/// 
+/// Verifies that a successful Execute RPC:
+/// - Returns actual guest output bytes in ExecuteResponse.result
+/// - Emits receipt with result = BLAKE3 hash of output
+/// - Receipt path = config allowed_root, size = actual bytes read
+/// 
+/// This validates the AD-009 result capture implementation end-to-end.
+#[tokio::test]
+async fn execute_rpc_happy_path_result_capture() -> Result<()> {
+    // Setup test certs and keys
+    let certs = TestCerts::generate()?;
+
+    // Create a temp directory for allowed_root with test files
+    let test_root = TempDir::new()?;
+    let safe_file = test_root.path().join("safe_file.txt");
+    let expected_content = b"Hello from WASM guest execution";
+    std::fs::write(&safe_file, expected_content)?;
+    let allowed_root = test_root.path().to_str().unwrap().to_string();
+
+    // Enable test mode to disable epoch interruption
+    enable_test_mode();
+
+    // Start server on a fixed port for this test
+    let config = create_test_config(&certs, 50061);
+    let server = TestServer::start(config).await?;
+    let addr = server.addr();
+
+    // Create client with mTLS
+    let mut client = create_client(&certs, addr).await?;
+
+    // Execute filesystem.read via gRPC with real WASM module
+    let safe_config = filesystem_read_config(&allowed_root, 1024);
+    let safe_wasm = wasm_test_modules::safe_read_module();
+    let req = execute_request("filesystem.read", safe_config, safe_wasm);
+
+    let resp = client.execute(Request::new(req)).await?;
+
+    // Verify ExecuteResponse
+    assert_eq!(resp.get_ref().success, true, "Execute should succeed");
+    let response_bytes = &resp.get_ref().result;
+    assert_eq!(response_bytes, expected_content, "ExecuteResponse.result must match guest output exactly");
+
+    // Verify receipt
+    let receipt_bytes = &resp.get_ref().receipt;
+    assert!(!receipt_bytes.is_empty(), "Receipt must not be empty");
+
+    // Parse receipt and verify fields
+    let receipt: ExecutionReceipt = serde_json::from_slice(receipt_bytes)?;
+    assert_eq!(receipt.capability_name, "filesystem.read");
+    assert_eq!(receipt.action, "execute");
+    assert_eq!(receipt.path, allowed_root); // path from config
+    assert_eq!(receipt.size, expected_content.len() as u64); // actual bytes read
+
+    // Verify result field is BLAKE3 hash of the content
+    let expected_hash = blake3::hash(expected_content).to_hex().to_string();
+    assert_eq!(receipt.result, expected_hash, "Receipt result must be BLAKE3 hash of guest output");
+
+    // Shutdown server
+    let _ = server._shutdown.send(());
+
+    Ok(())
+}
+
+/// GetReceiptChain returns the full receipt chain
+/// 
+/// Verifies that after Execute RPCs, GetReceiptChain returns the chain
+/// with all emitted receipts.
+#[tokio::test]
+async fn get_receipt_chain_returns_chain() -> Result<()> {
+    let certs = TestCerts::generate()?;
+
+    let test_root = TempDir::new()?;
+    let safe_file = test_root.path().join("safe_file.txt");
+    std::fs::write(&safe_file, b"content 1")?;
+    let allowed_root = test_root.path().to_str().unwrap().to_string();
+
+    enable_test_mode();
+
+    let config = create_test_config(&certs, 50062);
+    let server = TestServer::start(config).await?;
+    let addr = server.addr();
+
+    let mut client = create_client(&certs, addr).await?;
+
+    // Execute first request
+    let config1 = filesystem_read_config(&allowed_root, 1024);
+    let wasm1 = wasm_test_modules::safe_read_module();
+    let req1 = execute_request("filesystem.read", config1, wasm1);
+    let resp1 = client.execute(Request::new(req1)).await?;
+    assert_eq!(resp1.get_ref().success, true);
+
+    // Execute second request
+    let safe_file2 = test_root.path().join("safe_file2.txt");
+    std::fs::write(&safe_file2, b"content 2")?;
+    let config2 = filesystem_read_config(&allowed_root, 1024);
+    let wasm2 = wasm_test_modules::safe_read_module();
+    let req2 = execute_request("filesystem.read", config2, wasm2);
+    let resp2 = client.execute(Request::new(req2)).await?;
+    assert_eq!(resp2.get_ref().success, true);
+
+    // Get receipt chain
+    let chain_req = GetReceiptChainRequest {};
+    let chain_resp = client.get_receipt_chain(Request::new(chain_req)).await?;
+
+    // Verify chain has at least 4 receipts (2 per Execute: "read" from fs_read + "execute" from handler)
+    let chain = chain_resp.get_ref().receipts.clone();
+    assert!(chain.len() >= 4, "Receipt chain must contain 4 receipts (2 per Execute), got {}", chain.len());
+
+    // Verify each receipt in chain is valid JSON and has correct structure
+    // We expect 2 "read" receipts (from fs_read) and 2 "execute" receipts (from Execute handler)
+    let mut execute_count = 0;
+    let mut read_count = 0;
+    for receipt_bytes in chain {
+        let receipt: ExecutionReceipt = serde_json::from_slice(&receipt_bytes)?;
+        assert_eq!(receipt.capability_name, "filesystem.read");
+        match receipt.action.as_str() {
+            "execute" => execute_count += 1,
+            "read" => read_count += 1,
+            other => panic!("unexpected action: {}", other),
+        }
+        assert!(!receipt.result.is_empty(), "Receipt result must be hash");
+    }
+    assert_eq!(execute_count, 2, "Expected 2 execute receipts");
+    assert_eq!(read_count, 2, "Expected 2 read receipts");
+
+    let _ = server._shutdown.send(());
+
+    Ok(())
+}
+
+/// VerifyChain validates a valid chain from GetReceiptChain
+/// 
+/// Verifies that the chain returned by GetReceiptChain passes VerifyChain
+/// with valid=true when using the correct public key.
+#[tokio::test]
+async fn verify_chain_valid_via_grpc() -> Result<()> {
+    let certs = TestCerts::generate()?;
+
+    let test_root = TempDir::new()?;
+    let safe_file = test_root.path().join("safe_file.txt");
+    std::fs::write(&safe_file, b"valid content")?;
+    let allowed_root = test_root.path().to_str().unwrap().to_string();
+
+    enable_test_mode();
+
+    let config = create_test_config(&certs, 50063);
+    let server = TestServer::start(config).await?;
+    let addr = server.addr();
+
+    let mut client = create_client(&certs, addr).await?;
+
+    // Execute to generate a receipt
+    let safe_config = filesystem_read_config(&allowed_root, 1024);
+    let safe_wasm = wasm_test_modules::safe_read_module();
+    let req = execute_request("filesystem.read", safe_config, safe_wasm);
+    let resp = client.execute(Request::new(req)).await?;
+    assert_eq!(resp.get_ref().success, true);
+
+    // Get the receipt chain
+    let chain_resp = client.get_receipt_chain(Request::new(GetReceiptChainRequest {})).await?;
+    let chain = chain_resp.get_ref().receipts.clone();
+
+    // Get public key for verification
+    let key_pair = load_receipt_keypair(&certs.signing_key_path())?;
+    let public_key = key_pair.public_key().as_ref().to_vec();
+
+    // Verify the chain via gRPC
+    let verify_req = VerifyChainRequest {
+        receipts: chain,
+        public_key,
+    };
+    let verify_resp = client.verify_chain(Request::new(verify_req)).await?;
+
+    // Chain should be valid
+    assert_eq!(verify_resp.get_ref().valid, true, "Valid chain should verify as true");
+    assert!(verify_resp.get_ref().error_message.is_empty(), "Error message should be empty for valid chain");
+
+    let _ = server._shutdown.send(());
 
     Ok(())
 }

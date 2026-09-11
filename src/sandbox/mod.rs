@@ -582,7 +582,7 @@ fn aegis_fs_read(
     memory.data_mut(&mut caller)[out_ptr as usize..(out_ptr + contents.len() as i32) as usize]
         .copy_from_slice(&contents);
 
-    Ok(0) // success
+    Ok(contents.len() as i32) // return bytes read
 }
 
 /// Host function: atomic filesystem write within an allowed root.
