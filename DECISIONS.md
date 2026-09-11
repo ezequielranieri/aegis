@@ -356,3 +356,60 @@ Remaining for AD-008 closure:
 1. Implement result retrieval from guest memory (uses `result_ptr` from execute export)
 2. Re-run full Phase 5 verify with real WASM execution
 3. Archive Phase 5
+
+---
+## AD-009: Execute RPC Result Capture — Happy Path Receipt Integrity Gap
+
+**Date**: 2026-09-11
+**Phase**: 5 (agent-gateway integration)
+**Status**: Accepted (Open)
+
+### Context
+The Execute RPC now loads, instantiates, and executes WASM modules via wasmtime (AD-008). However, the **happy path result capture is not implemented**:
+
+| Component | Current Behavior | Expected |
+|-----------|------------------|----------|
+| `execute_wasm_capability` return | `Ok(b"WASM execution completed")` placeholder | Actual guest memory content at `result_ptr` |
+| `ReceiptEmitter.emit()` `result` param | `"success"` (hardcoded) | Actual guest execution result |
+| `ReceiptEmitter.emit()` `path` param | `""` (empty) | Path/args from guest execution |
+| `ReceiptEmitter.emit()` `size` param | `30` (placeholder length) | Actual result byte length |
+| `ExecuteResponse.result` field | `"WASM execution completed"` | Actual guest result bytes |
+
+The receipt **records fabricated data** (`result="success"`, `path=""`, `size=30`) instead of the actual guest WASM execution output. This breaks the core guarantee: *"cryptographic proof of what executed."*
+
+### Root Cause
+The `execute_wasm_capability` function:
+1. Calls the exported `execute` function which returns `result_ptr: i32` (guest memory pointer)
+2. Gets the memory export
+3. **Does not read guest memory at `result_ptr`** — marked as TODO
+4. Returns hardcoded placeholder bytes
+
+### Consequences
+- **Receipt integrity gap**: Every successful execution produces a receipt with fabricated `result="success"`, not the actual computation output
+- **Verification impossibility**: `agent-gateway` cannot verify what the WASM actually computed
+- **Audit trail corrupted**: Receipt chain shows successful executions but with meaningless result data
+- **Different from AD-008**: AD-008 fixed *error path* mapping (S-701/702/704/721); this is the *happy path* integrity
+
+### Decision
+**This is a separate gap from AD-008** (which fixed gRPC error mapping for S-701/702/704/721). AD-008 closed *error boundary* tests; this is the *happy path* data integrity.
+
+Create `AD-009` to track this. The hardening PR `hardening/grpc-boundary-tests` **can merge** — its scope was the 4 error scenarios (S-701/702/704/721), all now PASS. This AD tracks the happy-path work needed before Phase 5 archive.
+
+### Follow-up (New Branch: `fix/execute-result-capture`)
+1. Define guest/host ABI for result return:
+   - Option A: Guest writes result to known memory region (fixed offset or exported `__result_ptr` global)
+   - Option B: Guest returns `(ptr, len)` tuple from `execute` export
+   - Option C: Host function `aegis.result(ptr, len)` called by guest
+2. In `execute_wasm_capability`: read guest memory at `result_ptr` with length
+3. Pass actual result to `emit(capability, "execute", actual_result_str, path, actual_len)`
+4. Return actual result in `ExecuteResponse.result`
+5. Add test: `execute_rpc_happy_path_result_capture` verifying receipt `result` matches guest output
+
+### Traceability
+| Spec Requirement | Status | Evidence |
+|-----------------|--------|----------|
+| REQ-701 (Execute runs capability) | PARTIAL | WASM executes but result not captured |
+| REQ-708 (ExecuteResponse contains result) | NOT MET | Returns placeholder |
+| S-700 (Execute happy path) | NOT MET | Receipt has fabricated data |
+
+**Owner**: ez (assigned). **Target**: before Phase 5 archive.
