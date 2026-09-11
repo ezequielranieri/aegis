@@ -3,93 +3,55 @@
 **Change**: phase6-documentation
 **Project**: aegis
 **Archive Date**: 2026-09-11
-**Artifact Store**: openspec (per native dispatcher — filesystem artifacts only, no Engram observations written)
-**Verification Verdict**: PASS (22/22 tasks complete, 90 tests passing, no code changes)
+**Artifact Store**: openspec
+**Change Type**: documentation-only (strict TDD: false — no code or tests changed)
+**Verification Verdict**: PASS
 
----
+## Intent
+
+Documentation phase: ADRs AD-010..013 (host functions vs WASI; test-utils feature flag; mTLS over plain TLS; scope-creep cuts Q6), 3-boundary threat model, retrospective, and DECISIONS.md completeness verification (AD-010..013 + traceability rows already appended, lines 424-580).
 
 ## Final-State Facts
 
-This archive report reflects the state of the change AT CLOSE. All facts below are drawn from the applicable sources.
-
 | Metric | Final Value | Source |
 |--------|-------------|--------|
-| Tasks total | 22 | tasks.md |
-| Tasks complete | 22 | tasks.md — all `- [x]` |
-| Tasks incomplete | 0 | tasks.md |
-| Tests passing | 90 | `cargo test` (task 4.3) |
-| Tests failing | 0 | `cargo test` (task 4.3) |
-| ADRs archived | 4 (AD-010 through AD-013) | adrs/ — mirrored from DECISIONS.md |
-| Threat/mitigation pairs | 27 (11 sandbox + 9 gRPC + 7 receipt) | threat-model/threat-model.md |
-| Known gaps documented | 6 | threat-model/threat-model.md |
-| Code changes | None | `git diff --stat` shows only `openspec/` files (task 4.2) |
-| DECISIONS.md changes | None (verify-only) | AD-010..013 already appended (lines 424–561) |
-
----
+| Tasks | 22/22 `[x]` | tasks.md (persisted task artifact — highest authority) |
+| Verify | `valid: true`, verdict `pass` | native `gentle-ai sdd-verify-validate` |
+| Spec totals | 9 requirements / 9 scenarios | `### Requirement:` / `#### Scenario:` heading counts |
+| Tests | 90 passing | `cargo test` (task 4.3) |
+| Code changes | None | `git diff --stat` (task 4.2) |
+| Main spec | `openspec/specs/documentation/spec.md` | created — full-spec mechanical copy, empty `diff -r` |
 
 ## Archive Contents
 
-All artifacts present in `openspec/changes/archive/2026-09-11-phase6-documentation/`:
+`openspec/changes/archive/2026-09-11-phase6-documentation/`:
 
-- explore.md ✅ (verbatim copy of change explore.md — byte-identical)
-- proposal.md ✅ (verbatim copy of change proposal.md — byte-identical)
-- specs/documentation/spec.md ✅ (verbatim mirror of change spec — byte-identical)
-- adrs/ADR-010-host-functions-vs-wasi.md ✅ (mirror of DECISIONS.md AD-010)
-- adrs/ADR-011-test-utils-feature-flag.md ✅ (mirror of DECISIONS.md AD-011)
-- adrs/ADR-012-mtls-over-plain-tls.md ✅ (mirror of DECISIONS.md AD-012)
-- adrs/ADR-013-scope-creep-cuts-q6.md ✅ (mirror of DECISIONS.md AD-013)
-- threat-model/threat-model.md ✅ (3-boundary threat model + 6 known gaps)
-- retrospective.md ✅ (3 false PASSes pattern + corrective actions)
-- archive-report.md ✅ (this file)
+- explore.md, proposal.md, design.md, tasks.md, verify-report.md
+- archive-report.md (this file)
+- specs/documentation/spec.md
+- adrs/ADR-010-host-functions-vs-wasi.md, ADR-011-test-utils-feature-flag.md, ADR-012-mtls-over-plain-tls.md, ADR-013-scope-creep-cuts-q6.md
+- threat-model/threat-model.md
+- retrospective.md
 
----
+## Special Consolidation (approved resolution)
 
-## DECISIONS.md Verification (Phase 2)
-
-AD-010 through AD-013 were already appended to `DECISIONS.md` and were verified, not edited:
-
-| ADR | Location | Status |
-|-----|----------|--------|
-| AD-010 (Host Functions vs WASI) | `DECISIONS.md` line 424 | Accepted |
-| AD-011 (test-utils feature flag) | `DECISIONS.md` line 459 | Accepted |
-| AD-012 (mTLS over plain TLS) | `DECISIONS.md` line 493 | Accepted |
-| AD-013 (Scope Creep Cuts Q6) | `DECISIONS.md` line 529 | Accepted |
-| Traceability table (AD-010..013 rows) | `DECISIONS.md` lines 577–580 | Present |
-
----
-
-## Phase 5 Archive Verification (Phase 3)
-
-`openspec/changes/archive/2026-09-11-phase5-agent-gateway-integration/`:
-
-- proposal.md, design.md, specs/ (aegis-runtime-binary, grpc-runtime-server, signed-receipts), tasks.md, verify-report.md — all present
-- All implementation tasks (1.1–3.6) marked `[x]` in archived tasks.md
-- AD-008/AD-009 resolution: recorded in `DECISIONS.md` (AD-008 invalidated, AD-009 RESOLVED, 90 tests pass); the archived verify-report reflects the post-resolution state (result capture test present and passing)
-
----
+The archive destination pre-existed as the deliverable: apply tasks 1.1-1.11 wrote `openspec/changes/archive/2026-09-11-phase6-documentation/` directly. The standard move-destination collision rule (no merge/overwrite/suffix) therefore could not apply as-is. Resolution: change-folder artifacts missing from the destination — design.md, tasks.md, verify-report.md — were copied in (`cp`) and verified byte-identical; shared artifacts (explore.md, proposal.md, specs/) were verified byte-identical in place; the now-empty change folder was then removed. All copies mechanical, `diff -r` verified — no model-mediated byte transfer.
 
 ## Verification Evidence
 
-- **Tests**: `cargo test` — 90 passed, 0 failed
-- **Doc diff**: `git diff --stat` — only `openspec/` documentation files changed
-- **Archive structure**: `ls -R` confirms explore.md, proposal.md, specs/, adrs/×4, threat-model/, retrospective.md, archive-report.md
+All `diff -r` outputs were empty (the only passing evidence):
 
----
+- Step B: change `specs/documentation/spec.md` vs promoted `openspec/specs/documentation/spec.md`
+- Step C: design.md, tasks.md, verify-report.md copies (consolidation)
+- Step C: explore.md, proposal.md, specs/ byte-identity (shared artifacts)
 
-## Rollback
+## Lessons Learned / Follow-Ups
 
-Delete `openspec/changes/archive/2026-09-11-phase6-documentation/` and revert the tasks.md checkboxes. No code changes to revert; `DECISIONS.md` was not modified by this phase.
-
----
+- The standard archive `mv` collision rule required manual resolution because apply created the destination as the deliverable. Recommend future documentation phases write deliverables into the change folder and let archive perform the move — or state explicitly in tasks that destination pre-creation is intended.
+- Spec totals are 9 requirements / 9 scenarios; the spec agent's report said 8. Count headings, never trust prose.
+- Pre-existing Phase 5 archive inconsistency: archived tasks.md still shows task 4.1 unchecked while its verify-report claims 36/36. Left untouched per audit-trail rule — worth a follow-up.
+- ADR files use a "Traceability" section (mirrors DECISIONS.md) where spec scenarios name "Source" — content present; naming follows the DECISIONS.md convention.
 
 ## SDD Cycle Complete
 
-The change **phase6-documentation** has been fully implemented and archived.
-
-- Proposal → Spec → Design → Tasks → Apply → Verify → Archive: documentation phase complete
-- All 22 tasks marked complete in persisted task artifact
-- All four ADRs (AD-010..013) mirrored verbatim from DECISIONS.md
-- Threat model and retrospective curated from explore.md without inventing new technical content
-- 90 tests still passing, zero code changes
-
-**Ready for verify and the next change.**
+phase6-documentation fully planned, implemented, verified, and archived. Ready for the next change.
