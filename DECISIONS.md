@@ -330,20 +330,29 @@ Verify relied on artifact existence and compile success, not behavioral validati
 ### Traceability
 | Spec Requirement | Status | Evidence |
 |-----------------|--------|----------|
-| REQ-714 (Execute runs capability) | **NOT MET** | Stub returns hardcoded string |
-| REQ-715 (Execute traps on violation) | **NOT MET** | No sandbox execution = no violation possible |
-| S-700 (Execute happy path) | **UNTESTABLE** | Requires real WASM execution |
-| S-701 (Execute violation trap) | **UNTESTABLE** | Currently `@ignore` in hardening tests |
-| S-702 (Execute signing failure) | **UNTESTABLE** | Currently `@ignore` in hardening tests |
-| S-721 (Execute corrupt key) | **UNTESTABLE** | Currently `@ignore` in hardening tests |
+| REQ-714 (Execute runs capability) | **PARTIAL** | WASM loads/instantiates/executes via `instantiate_with_capabilities` + `execute` export; result capture TODO |
+| REQ-715 (Execute traps on violation) | **MET** | Path traversal & size exceed → gRPC success=false with error (S-701 PASS) |
+| S-700 (Execute happy path) | **UNTESTABLE** | Requires real WASM execution with result capture |
+| S-701 (Execute violation trap) | **PASS** | Traversal & size exceed correctly map to gRPC success=false with error message |
+| S-702 (Execute signing failure) | **PASS** | Forced signing failure via test-only emitter → gRPC success=false with "receipt signing failure" error |
+| S-721 (Execute corrupt key) | **NOT APPLICABLE** | Ed25519 validates at load time; key that "loads but fails to sign" cannot exist. Coverage in S-806/S-807 (startup validation). |
 
-### Follow-up
-New branch `fix/execute-wasmtime-wiring` to implement real Execute:
-1. Determine WASM module source (embedded test module? config path? upload via gRPC?)
-2. Add `wasm_module_path` or similar to `ExecuteRequest` / `RuntimeConfig`
-3. In Execute handler: load module → `instantiate_with_capabilities` → call export → capture result
-4. Remove `execute_filesystem_read` stub
-5. Re-enable `@ignore` tests in `hardening/grpc-boundary-tests`
-6. Re-run full verify for Phase 5
+### Progress (2026-09-11)
+| Scenario | Status | Notes |
+|----------|--------|-------|
+| S-701 | ✅ PASS | Path traversal & size exceed via WASM execution; FAILED_PRECONDITION → gRPC success=false |
+| S-702 | ✅ PASS | `force_signing_failure()` on shared emitter → gRPC success=false with "receipt signing failure" |
+| S-704 | ✅ PASS | VerifyChain tampered receipt → gRPC valid=false |
+| S-721 | 📝 DOCUMENTED | Not applicable — Ed25519 validates at load time; see S-806/S-807 |
 
-**Owner**: ez (assigned). **Target**: before any Phase 5 archive or Phase 6 work.
+Execute RPC now:
+- Loads WASM from `ExecuteRequest.wasm_module` (new protobuf field 3)
+- Calls `instantiate_with_capabilities(wasm_bytes, capabilities)` 
+- Invokes exported `execute()` function via wasmtime
+- Returns `success=false` with descriptive error for violations (traversal, size, signing failure)
+- Result capture from guest memory still TODO (returns placeholder)
+
+Remaining for AD-008 closure:
+1. Implement result retrieval from guest memory (uses `result_ptr` from execute export)
+2. Re-run full Phase 5 verify with real WASM execution
+3. Archive Phase 5
