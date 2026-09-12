@@ -62,9 +62,11 @@ fn load_multi_capability_config() {
     match &config.capabilities[2] {
         CapabilityDef::NetworkHttp {
             allowed_hosts,
+            allowed_methods,
             max_requests_per_second,
         } => {
             assert_eq!(allowed_hosts, &vec!["example.com".to_string()]);
+            assert_eq!(allowed_methods, &vec!["GET".to_string()]);
             assert_eq!(*max_requests_per_second, 10);
         }
         other => panic!("Expected NetworkHttp, got: {:?}", other),

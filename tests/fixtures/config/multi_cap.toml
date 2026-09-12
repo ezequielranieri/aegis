@@ -11,4 +11,5 @@ max_write_bytes = 2097152
 [[capabilities]]
 name = "network.http"
 allowed_hosts = ["example.com"]
+allowed_methods = ["GET"]
 max_requests_per_second = 10
