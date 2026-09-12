@@ -1214,7 +1214,11 @@ fn aegis_http_fetch(
 
     // 10. Copy ≤ out_len into guest memory, then record host-authoritative
     //     fetch state (D5) — read later by the Execute handler (REQ-610).
-    memory.data_mut(&mut caller)[out_start as usize..out_end as usize].copy_from_slice(&body);
+    //     `copy_from_slice` requires EQUAL lengths, so slice the destination
+    //     to exactly `body.len()` bytes (the :1196 guard already proved
+    //     `body.len() <= out_len` — buffer may be larger than the body).
+    memory.data_mut(&mut caller)[out_start as usize..out_start as usize + body.len()]
+        .copy_from_slice(&body);
     caller.data_mut().network_fetch = Some(FetchRecord {
         url: url_str,
         body_blake3,
