@@ -1183,14 +1183,18 @@ fn aegis_http_fetch(
     // 8. Guest output buffer must fit the body (copy ≤ out_len; all arithmetic
     //    in i64 — never panic on guest-provided bounds). Checked BEFORE the
     //    success receipt so the chain never records success for an attempt
-    //    that cannot deliver data (fs precedent: plain trap, no receipt).
+    //    that cannot deliver data. The fetch was already observed remotely, so
+    //    emit a trap receipt with the real size — never leave an observed
+    //    fetch without a signed receipt in the chain (AD-005 class, REQ-609).
     let out_start = i64::from(out_ptr);
     let out_end = out_start + i64::from(out_len);
     let mem_len = memory.data(&caller).len() as i64;
     if out_start < 0 || out_end < out_start || out_end > mem_len {
+        emit_network_receipt(&caller, &url_str, body.len() as u64, "trap")?;
         bail!("output buffer too small");
     }
     if body.len() as i64 > out_end - out_start {
+        emit_network_receipt(&caller, &url_str, body.len() as u64, "trap")?;
         bail!("output buffer too small");
     }
 
