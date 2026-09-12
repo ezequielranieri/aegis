@@ -561,6 +561,48 @@ Phase 6 is documentation-only. All implementation features are deferred to futur
 
 ---
 
+## AD-014: Network HTTP Capability Architecture (Phase 7)
+
+**Date**: 2026-09-12
+**Phase**: 7 (network.http)
+**Status**: Accepted
+
+### Context
+`Capability::NetworkHttp` was a NO-OP never wired to any host function (ADR-013 cut item #1). Phase 7 reinstates it as a TLS-only HTTPS client host function `aegis_http_fetch` with host allowlist, method allowlist, per-execution token-bucket rate limit, and 1 MiB response cap. Violations trap fail-closed with signed fetch receipts (S-601..S-606, REQ-601..REQ-610).
+
+### Decision
+Adopt the six design decisions D1..D6 from the Phase 7 design as the network capability architecture.
+
+| # | Decision | Choice | Alternatives | Rationale |
+|---|----------|--------|--------------|-----------|
+| D1 | HTTP client | `ureq = { version = "3", default-features = false, features = ["rustls"] }` (rustls 0.23, ring) | `reqwest::blocking` (hyper stack); ureq 2.12 | Blocking I/O matches `Linker::func_wrap`; pure Rust; ring matches existing deps; no gzip → body bytes are wire bytes for BLAKE3 |
+| D2 | Policy carrier | `SandboxState.network_http: Option<NetworkHttpParams>` + `network_bucket`/`network_agent`/`network_fetch` | Extend `CapabilityConfig`; closure captures | `Option` is zero-cost for non-network sandboxes; `CapabilityConfig::from(NetworkHttp)` arm kept for match exhaustiveness only |
+| D3 | Rate limit | Per-execution `TokenBucket` on `SandboxState` (refill-on-demand, no `Mutex`/timer) | Global bucket (out of scope); closure `Cell` (borrow-fragile) | Fresh `Sandbox` per Execute RPC resets the bucket → per-execution semantics (REQ-606, E-605) |
+| D4 | Trap→gRPC | `msg.starts_with("network ")` as the FIRST guard in the Execute trap cascade; dispatch by catalog second word (endpoint/method/connection/timeout/response-size/rate) | Error-code envelope (overkill); positional insertion into the cascade (order-dependent) | S-605's "size"/"exceed" must never hit the generic fs size branch; S-601 embeds a guest-controlled URL (may contain `..`/`size`/`max`) that must never be evaluated against fs branches — only a prefix guard is structurally safe |
+| D5 | REQ-610 URL | Host stores `FetchRecord { url, body_blake3, body_len }` on success; Execute handler reads it for the execute receipt (path = fetched URL, result = BLAKE3(body), size = body len) | Guest returns URL via WASM result (untrusted); comma-joined allowlist (rejected at review) | The host is the only party that knows which URL was actually fetched |
+| D6 | AD timing | Design records the decision; `AD-014` transcribed at apply | — | decision-log: docs updated in the same work unit as the code |
+
+### Implementation Notes (WU 2 refinements)
+- `max_redirects(0)`: redirects could escape the host allowlist — fail-closed hardening over the design default.
+- `http_status_as_error(false)`: 4xx/5xx responses return their bodies to the guest instead of trapping.
+- URL parsing via `ureq::http::Uri` (no `url` dependency added); covers scheme/authority/port/path validation needs.
+- Output-buffer-too-small now emits a trap receipt (path=URL, size=body.len()) before bailing — closes the AD-005-class audit gap (observed remote fetch with no signed receipt).
+- Reinstates ADR-013 cut item #1 (read-only reference): `openspec/changes/archive/2026-09-11-phase6-documentation/adrs/ADR-013-scope-creep-cuts-q6.md`.
+
+### Consequences
+- Execute-level receipts for performed fetches report the host-recorded `FetchRecord` (URL / BLAKE3(body) / body length, REQ-610); modules that never fetch fall back to the generic values.
+- Network traps surface as gRPC `success=false` (FAILED_PRECONDITION) with clean mapped messages.
+- Existing configs remain valid: `allowed_methods` defaults to `["GET"]` via serde default (REQ-601).
+- Rollback is scoped: revert the `NetworkHttp` arm to NO-OP + the guard to the fs cascade, delete this AD — no receipt schema change.
+
+### Traceability
+- Spec: `openspec/changes/phase7-network-http/specs/network-http/spec.md` REQ-601..REQ-610, S-601..S-606
+- Design: `openspec/changes/phase7-network-http/design.md` D1..D6, Data Flow
+- Tests: `tests/network_http.rs` + `tests/grpc_boundary.rs` REQ-610 E2E (Phase 4)
+- Related: ADR-013 (scope cuts), AD-010 (host functions vs WASI), AD-005 (receipt gap class)
+
+---
+
 ## Traceability
 
 | Decision | Spec Req | Design Section | Implementation |
@@ -578,3 +620,4 @@ Phase 6 is documentation-only. All implementation features are deferred to futur
 | AD-011 | REQ-433, S-416, S-702 | test-utils feature flag | `#[cfg(feature = "test-utils")]` on `ReceiptEmitter` |
 | AD-012 | REQ-713, REQ-716 | mTLS over plain TLS | `AegisClientCertVerifier` with CN/SAN |
 | AD-013 | Phase 6 scope | Scope creep cuts | `network.http`, WASI, fuel, two-phase emission deferred |
+| AD-014 | REQ-601..REQ-610, S-601..S-606 | D1..D6 | `aegis_http_fetch` host fn + `FetchRecord`-backed execute receipt |

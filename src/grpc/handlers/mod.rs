@@ -109,15 +109,29 @@ impl AegisRuntime for AegisRuntimeService {
                 // Calculate BLAKE3 hash for receipt
                 let result_hash = blake3::hash(&result_bytes).to_hex().to_string();
 
-                // Extract path from capability config for receipt
-                let capability_path = match &matching_cap {
-                    crate::capabilities::Capability::FilesystemRead(params) => {
-                        params.allowed_root.to_string_lossy().to_string()
+                // Extract path from capability config for receipt (REQ-610, D5).
+                // For network.http the host-recorded `FetchRecord` is authoritative:
+                // path = the URL actually fetched, result = BLAKE3(body) hex,
+                // size = response byte length. When no fetch was performed
+                // (`None` — module never fetched, or trapped mid-flight), fall
+                // back to the generic values; REQ-610 constrains performed fetches.
+                let (capability_path, result_hash, size) = match &matching_cap {
+                    crate::capabilities::Capability::FilesystemRead(params) => (
+                        params.allowed_root.to_string_lossy().to_string(),
+                        result_hash,
+                        result_bytes.len() as u64,
+                    ),
+                    crate::capabilities::Capability::FilesystemWrite(params) => (
+                        params.allowed_root.to_string_lossy().to_string(),
+                        result_hash,
+                        result_bytes.len() as u64,
+                    ),
+                    crate::capabilities::Capability::NetworkHttp(_) => {
+                        match sandbox.store_mut().data_mut().network_fetch.take() {
+                            Some(fetch) => (fetch.url, fetch.body_blake3, fetch.body_len),
+                            None => (String::new(), result_hash, result_bytes.len() as u64),
+                        }
                     }
-                    crate::capabilities::Capability::FilesystemWrite(params) => {
-                        params.allowed_root.to_string_lossy().to_string()
-                    }
-                    crate::capabilities::Capability::NetworkHttp(_) => String::new(),
                 };
 
                 // 8. Emit a success receipt for this execution
@@ -130,7 +144,7 @@ impl AegisRuntime for AegisRuntimeService {
                             &capability_name,
                             "execute",
                             &capability_path,
-                            result_bytes.len() as u64,
+                            size,
                             &result_hash,
                         )
                         .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?;
@@ -308,7 +322,38 @@ impl AegisRuntimeService {
             }
             tracing::debug!(full_error = %msg, "WASM trap error chain");
 
-            let clean_msg = if msg.contains("traversal")
+            // D4: the "network " guard MUST be the first branch of this cascade.
+            // wasmtime 24 wraps host-fn traps in a backtrace frame — the catalog
+            // message lives in the error chain, not in the top-level Display —
+            // so walk the chain and structurally isolate all network messages
+            // from the fs branches below. An S-601 message embeds the
+            // guest-controlled URL (may contain `..` / `size` / `max`) and must
+            // never be evaluated against them. Inside the guard, dispatch by the
+            // catalog message's second word (endpoint/method/connection/timeout/
+            // response-size/rate).
+            let network_msg =
+                std::iter::successors(e.source(), |src| src.source()).find_map(|src| {
+                    let frame = src.to_string();
+                    frame.starts_with("network ").then_some(frame)
+                });
+
+            let clean_msg = if let Some(network_msg) = network_msg {
+                if network_msg.starts_with("network endpoint") {
+                    "network endpoint not allowed"
+                } else if network_msg.starts_with("network method") {
+                    "network method not allowed"
+                } else if network_msg.starts_with("network connection") {
+                    "network connection failed"
+                } else if network_msg.starts_with("network timeout") {
+                    "network timeout exceeded"
+                } else if network_msg.starts_with("network response size") {
+                    "network response size limit exceeded"
+                } else if network_msg.starts_with("network rate limit") {
+                    "network rate limit exceeded"
+                } else {
+                    "WASM execution trapped"
+                }
+            } else if msg.contains("traversal")
                 || msg.contains("..")
                 || msg.contains("outside")
                 || msg.contains("traversal attempt")
