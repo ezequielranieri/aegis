@@ -18,8 +18,8 @@ use crate::proto::aegis::v1::health_server::HealthServer;
 use crate::receipts::ReceiptEmitter;
 use crate::sandbox::load_receipt_keypair;
 
-use super::handlers::AegisRuntimeService;
 use super::handlers::health::HealthService;
+use super::handlers::AegisRuntimeService;
 use super::tls;
 
 /// Start the gRPC server with the given configuration.
@@ -76,7 +76,7 @@ pub async fn start_server_internal_with_emitter(
     receipt_emitter: Arc<Mutex<ReceiptEmitter>>,
 ) -> anyhow::Result<SocketAddr> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    
+
     // Validate that the emitter has a valid key (test only)
     if config.receipts.key_path.exists() {
         let _ = load_receipt_keypair(&config.receipts.key_path)
@@ -130,7 +130,7 @@ async fn start_server_with_emitter(
         .await
         .map_err(|e| anyhow::anyhow!("gRPC server error: {}", e))?;
 
-tracing::info!("gRPC server stopped");
+    tracing::info!("gRPC server stopped");
     Ok(local_addr)
 }
 

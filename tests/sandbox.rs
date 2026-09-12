@@ -626,7 +626,8 @@ fn sandbox_with_receipts() -> (Sandbox, ring::signature::Ed25519KeyPair) {
 
     // Manually inject the receipt emitter with its own keypair
     let emitter = aegis::receipts::ReceiptEmitter::new(emitter_key);
-    sandbox.store_mut().data_mut().receipt_emitter = Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
+    sandbox.store_mut().data_mut().receipt_emitter =
+        Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
 
     (sandbox, key_pair)
 }
@@ -829,7 +830,8 @@ fn receipt_s416_signing_failure() {
     let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
         .expect("Failed to create sandbox");
     let mut emitter = aegis::receipts::ReceiptEmitter::new(key_pair);
-    sandbox.store_mut().data_mut().receipt_emitter = Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
+    sandbox.store_mut().data_mut().receipt_emitter =
+        Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
 
     let wasm = parse_str(ALLOWED_READ).expect("WAT parse failed");
     let instance = sandbox
@@ -1372,7 +1374,8 @@ fn receipt_s416_write_signing_failure() {
         ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
     };
     let emitter = aegis::receipts::ReceiptEmitter::new(emitter_key);
-    sandbox.store_mut().data_mut().receipt_emitter = Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
+    sandbox.store_mut().data_mut().receipt_emitter =
+        Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
 
     let wasm = parse_str(ALLOWED_WRITE).expect("WAT parse failed");
     let instance = sandbox
@@ -1428,7 +1431,8 @@ fn receipt_s416_write_after_rename() {
         ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
     };
     let emitter = aegis::receipts::ReceiptEmitter::new(emitter_key);
-    sandbox.store_mut().data_mut().receipt_emitter = Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
+    sandbox.store_mut().data_mut().receipt_emitter =
+        Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
 
     let wasm = parse_str(ALLOWED_WRITE).expect("WAT parse failed");
     let instance = sandbox

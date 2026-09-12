@@ -32,11 +32,7 @@ impl Health for HealthService {
     }
 
     type WatchStream = std::pin::Pin<
-        Box<
-            dyn futures_core::Stream<Item = Result<HealthCheckResponse, Status>>
-                + Send
-                + 'static,
-        >,
+        Box<dyn futures_core::Stream<Item = Result<HealthCheckResponse, Status>> + Send + 'static>,
     >;
 
     async fn watch(
@@ -56,8 +52,7 @@ impl Health for HealthService {
             status: status.into(),
         };
 
-        let stream =
-            tokio_stream::iter(vec![Ok(response)]);
+        let stream = tokio_stream::iter(vec![Ok(response)]);
         Ok(Response::new(Box::pin(stream)))
     }
 }

@@ -25,8 +25,8 @@ pub mod proto {
     }
 }
 
+pub use config::runtime::{ExecutionConfig, RuntimeConfig, ServerConfig, TlsConfig};
 pub use config::{CapabilityDef, ConfigError, PolicyConfig, ReceiptsConfig};
-pub use config::runtime::{RuntimeConfig, ServerConfig, TlsConfig, ExecutionConfig};
 pub use sandbox::{
     load_receipt_keypair, CapabilityConfig, EpochInterrupter, Sandbox, SandboxConfig,
 };

@@ -66,7 +66,10 @@ max_concurrent = 8
         let tls = config.server.tls.as_ref().unwrap();
         assert_eq!(tls.cert_path, PathBuf::from("/etc/aegis/server.crt"));
         assert_eq!(tls.expected_identity, "agent-gateway");
-        assert_eq!(config.receipts.key_path, PathBuf::from("/etc/aegis/signing_key.toml"));
+        assert_eq!(
+            config.receipts.key_path,
+            PathBuf::from("/etc/aegis/signing_key.toml")
+        );
         assert_eq!(config.execution.max_concurrent, 8);
     }
 

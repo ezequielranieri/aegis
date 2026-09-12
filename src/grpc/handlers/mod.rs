@@ -5,7 +5,6 @@
 
 pub mod health;
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Semaphore;
@@ -18,7 +17,6 @@ use crate::proto::aegis::v1::{
 };
 use crate::receipts::{ExecutionReceipt, ReceiptChain, ReceiptEmitter};
 use crate::sandbox::{Sandbox, SandboxConfig};
-use crate::capabilities::Capability;
 
 /// Shared state for all AegisRuntime RPC handlers.
 pub struct AegisRuntimeService {
@@ -38,9 +36,7 @@ impl AegisRuntime for AegisRuntimeService {
             .semaphore
             .clone()
             .try_acquire_owned()
-            .map_err(|_| {
-                Status::resource_exhausted("max concurrent executions exceeded")
-            })?;
+            .map_err(|_| Status::resource_exhausted("max concurrent executions exceeded"))?;
 
         let req = request.into_inner();
         let capability_name = req.capability_name;
@@ -71,7 +67,7 @@ impl AegisRuntime for AegisRuntimeService {
             return Err(Status::invalid_argument("wasm_module is required"));
         }
 
-// 4. Create sandbox for this request
+        // 4. Create sandbox for this request
         // Check for test mode to disable epoch interruption entirely (avoids "wasm trap: interrupt" in tests)
         let test_mode = std::env::var("AEGIS_TEST_MODE").is_ok();
         let mut sandbox = if test_mode {
@@ -88,8 +84,7 @@ impl AegisRuntime for AegisRuntimeService {
         };
 
         // 5. Set the shared receipt emitter on the sandbox
-        sandbox.store_mut().data_mut().receipt_emitter =
-            Some(self.receipt_emitter.clone());
+        sandbox.store_mut().data_mut().receipt_emitter = Some(self.receipt_emitter.clone());
 
         // 6. Find the matching capability by name
         let matching_cap = capabilities
@@ -116,8 +111,12 @@ impl AegisRuntime for AegisRuntimeService {
 
                 // Extract path from capability config for receipt
                 let capability_path = match &matching_cap {
-                    crate::capabilities::Capability::FilesystemRead(params) => params.allowed_root.to_string_lossy().to_string(),
-                    crate::capabilities::Capability::FilesystemWrite(params) => params.allowed_root.to_string_lossy().to_string(),
+                    crate::capabilities::Capability::FilesystemRead(params) => {
+                        params.allowed_root.to_string_lossy().to_string()
+                    }
+                    crate::capabilities::Capability::FilesystemWrite(params) => {
+                        params.allowed_root.to_string_lossy().to_string()
+                    }
                     crate::capabilities::Capability::NetworkHttp(_) => String::new(),
                 };
 
@@ -127,7 +126,13 @@ impl AegisRuntime for AegisRuntimeService {
                         Status::internal(format!("receipt emitter lock failed: {}", e))
                     })?;
                     emitter
-                        .emit(&capability_name, "execute", &capability_path, result_bytes.len() as u64, &result_hash)
+                        .emit(
+                            &capability_name,
+                            "execute",
+                            &capability_path,
+                            result_bytes.len() as u64,
+                            &result_hash,
+                        )
                         .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?;
                 }
 
@@ -184,14 +189,10 @@ impl AegisRuntime for AegisRuntimeService {
         // Parse receipts from request bytes
         let mut receipts = Vec::new();
         for (i, receipt_bytes) in req.receipts.iter().enumerate() {
-            let receipt: ExecutionReceipt =
-                serde_json::from_slice(receipt_bytes).map_err(|e| {
-                    tracing::warn!(index = i, error = %e, "failed to parse receipt");
-                    Status::invalid_argument(format!(
-                        "receipt at index {} is not valid JSON: {}",
-                        i, e
-                    ))
-                })?;
+            let receipt: ExecutionReceipt = serde_json::from_slice(receipt_bytes).map_err(|e| {
+                tracing::warn!(index = i, error = %e, "failed to parse receipt");
+                Status::invalid_argument(format!("receipt at index {} is not valid JSON: {}", i, e))
+            })?;
             receipts.push(receipt);
         }
 
@@ -234,9 +235,10 @@ impl AegisRuntime for AegisRuntimeService {
     ) -> Result<Response<GetReceiptChainResponse>, Status> {
         tracing::info!("get receipt chain request received");
 
-        let emitter = self.receipt_emitter.lock().map_err(|e| {
-            Status::internal(format!("receipt emitter lock failed: {}", e))
-        })?;
+        let emitter = self
+            .receipt_emitter
+            .lock()
+            .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
 
         let chain = emitter.chain();
 
@@ -248,9 +250,7 @@ impl AegisRuntime for AegisRuntimeService {
 
         tracing::info!(count = receipts.len(), "returning receipt chain");
 
-        Ok(Response::new(GetReceiptChainResponse {
-            receipts,
-        }))
+        Ok(Response::new(GetReceiptChainResponse { receipts }))
     }
 }
 
@@ -288,36 +288,44 @@ impl AegisRuntimeService {
             .get_typed_func::<(), (i32, i32)>(&mut sandbox.store_mut(), "execute")
             .map_err(|e| {
                 tracing::error!(error = %e, "exported function 'execute' not found");
-                Status::failed_precondition(format!("WASM module must export 'execute' function returning (ptr, len): {}", e))
+                Status::failed_precondition(format!(
+                    "WASM module must export 'execute' function returning (ptr, len): {}",
+                    e
+                ))
             })?;
 
         // Call the execute function (no arguments, returns ptr and len)
-        let (ptr, len) = execute_func
-            .call(&mut sandbox.store_mut(), ())
-            .map_err(|e| {
-                tracing::error!(error = %e, "WASM execution trapped");
-                let mut msg = e.to_string();
-                if let Some(source) = e.source() {
-                    msg.push_str(" | source: ");
-                    msg.push_str(&source.to_string());
-                    if let Some(source2) = source.source() {
-                        msg.push_str(" | source2: ");
-                        msg.push_str(&source2.to_string());
-                    }
+        let (ptr, len) = execute_func.call(sandbox.store_mut(), ()).map_err(|e| {
+            tracing::error!(error = %e, "WASM execution trapped");
+            let mut msg = e.to_string();
+            if let Some(source) = e.source() {
+                msg.push_str(" | source: ");
+                msg.push_str(&source.to_string());
+                if let Some(source2) = source.source() {
+                    msg.push_str(" | source2: ");
+                    msg.push_str(&source2.to_string());
                 }
-                tracing::debug!(full_error = %msg, "WASM trap error chain");
-                
-                let clean_msg = if msg.contains("traversal") || msg.contains("..") || msg.contains("outside") || msg.contains("traversal attempt") {
-                    "path traversal attempt detected"
-                } else if msg.contains("size") || msg.contains("exceed") || msg.contains("max") {
-                    "size limit exceeded"
-                } else if msg.contains("signing") || msg.contains("receipt") || msg.contains("test-forced") {
-                    "receipt signing failure"
-                } else {
-                    "WASM execution trapped"
-                };
-                Status::failed_precondition(clean_msg)
-            })?;
+            }
+            tracing::debug!(full_error = %msg, "WASM trap error chain");
+
+            let clean_msg = if msg.contains("traversal")
+                || msg.contains("..")
+                || msg.contains("outside")
+                || msg.contains("traversal attempt")
+            {
+                "path traversal attempt detected"
+            } else if msg.contains("size") || msg.contains("exceed") || msg.contains("max") {
+                "size limit exceeded"
+            } else if msg.contains("signing")
+                || msg.contains("receipt")
+                || msg.contains("test-forced")
+            {
+                "receipt signing failure"
+            } else {
+                "WASM execution trapped"
+            };
+            Status::failed_precondition(clean_msg)
+        })?;
 
         eprintln!("DEBUG execute_wasm: ptr={}, len={}", ptr, len);
 
@@ -328,7 +336,7 @@ impl AegisRuntimeService {
 
         // Get memory export from the instance (after call, store is free)
         let memory = instance
-            .get_memory(&mut sandbox.store_mut(), "memory")
+            .get_memory(sandbox.store_mut(), "memory")
             .ok_or_else(|| Status::internal("memory export required"))?;
 
         // Read result bytes from guest memory
@@ -338,7 +346,9 @@ impl AegisRuntimeService {
         let store = sandbox.store_mut();
         let data = memory.data(store);
         if ptr + len > data.len() {
-            return Err(Status::internal("WASM result ptr/len exceeds memory bounds"));
+            return Err(Status::internal(
+                "WASM result ptr/len exceeds memory bounds",
+            ));
         }
         let result_bytes = data[ptr..ptr + len].to_vec();
 
