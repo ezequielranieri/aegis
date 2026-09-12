@@ -13,8 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine;
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, IsCa,
-    KeyPair as RcgenKeyPair,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair as RcgenKeyPair,
 };
 use ring::signature::KeyPair as RingKeyPair;
 use tempfile::TempDir;
@@ -40,8 +39,6 @@ fn enable_test_mode() {
 
 /// WASM test module generator using wat::parse_str
 mod wasm_test_modules {
-    use wat;
-
     /// Safe filesystem.read module - reads a valid file within allowed_root
     /// Returns (ptr, len) of the content read by fs_read
     /// Only imports fs_read since config only grants filesystem.read
@@ -129,6 +126,7 @@ mod wasm_test_modules {
 
     /// Safe filesystem.write module - imports both fs_read and fs_write
     /// (for future tests that grant both capabilities)
+    #[expect(dead_code, reason = "reserved for future dual-capability E2E tests")]
     pub fn safe_write_module() -> Vec<u8> {
         wat::parse_str(
             r#"
@@ -154,13 +152,11 @@ mod wasm_test_modules {
 }
 
 /// Test certificate and key material for mTLS testing
+///
+/// Certificate/key values are used only during generation to write PEMs to the
+/// temp dir; all later access goes through the `*_path()` accessors, so the
+/// values themselves are not retained (clippy dead-code).
 struct TestCerts {
-    ca_cert: Certificate,
-    ca_key: RcgenKeyPair,
-    server_cert: Certificate,
-    server_key: RcgenKeyPair,
-    client_cert: Certificate,
-    client_key: RcgenKeyPair,
     temp_dir: TempDir,
 }
 
@@ -237,15 +233,7 @@ private_key = "{}"
             )?;
         }
 
-        Ok(Self {
-            ca_cert,
-            ca_key,
-            server_cert,
-            server_key,
-            client_cert,
-            client_key,
-            temp_dir,
-        })
+        Ok(Self { temp_dir })
     }
 
     fn ca_path(&self) -> PathBuf {
@@ -268,20 +256,20 @@ private_key = "{}"
     }
 }
 
-/// Test server handle with address, shutdown, and ReceiptEmitter reference
+/// Test server handle with address and shutdown.
+///
+/// The `ReceiptEmitter` is returned separately by `start_with_emitter` when a
+/// test needs it; it is not retained on the handle (clippy dead-code).
 struct TestServer {
     addr: std::net::SocketAddr,
     _shutdown: tokio::sync::oneshot::Sender<()>,
     _handle: JoinHandle<anyhow::Result<std::net::SocketAddr>>,
-    /// Shared ReceiptEmitter for test-only operations (e.g., force_signing_failure)
-    receipt_emitter: Arc<StdMutex<ReceiptEmitter>>,
 }
 
 impl TestServer {
     /// Start a test gRPC server on a fixed port with mTLS
     /// Creates the ReceiptEmitter internally (production-like path).
     async fn start(config: RuntimeConfig) -> Result<Self> {
-        let key_path = config.receipts.key_path.clone();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let port = config.server.port;
 
@@ -299,22 +287,15 @@ impl TestServer {
         // Wait a bit for server to start
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // We can't get the emitter back from start_server_internal, so we create a dummy
-        // For tests that need the emitter, use `start_with_emitter` instead
-        let key_pair = load_receipt_keypair(&key_path)
-            .map_err(|e| anyhow::anyhow!("failed to load receipt key: {}", e))?;
-        let receipt_emitter = Arc::new(StdMutex::new(ReceiptEmitter::new(key_pair)));
-
         Ok(Self {
             addr,
             _shutdown: shutdown_tx,
             _handle: handle,
-            receipt_emitter,
         })
     }
 
     /// Start a test gRPC server with a pre-created ReceiptEmitter.
-    /// Returns the TestServer AND retains the emitter for test-only operations.
+    /// Returns the TestServer plus the emitter for test-only operations.
     async fn start_with_emitter(
         config: RuntimeConfig,
     ) -> Result<(Self, Arc<StdMutex<ReceiptEmitter>>)> {
@@ -349,7 +330,6 @@ impl TestServer {
                 addr,
                 _shutdown: shutdown_tx,
                 _handle: handle,
-                receipt_emitter: Arc::clone(&receipt_emitter),
             },
             receipt_emitter,
         ))
@@ -357,11 +337,6 @@ impl TestServer {
 
     fn addr(&self) -> SocketAddr {
         self.addr
-    }
-
-    /// Get a reference to the shared ReceiptEmitter for test-only operations.
-    fn emitter(&self) -> &Arc<StdMutex<ReceiptEmitter>> {
-        &self.receipt_emitter
     }
 }
 
@@ -424,6 +399,8 @@ capabilities = [
 }
 
 /// Helper to create a filesystem.write capability config for Execute requests
+/// (kept for future tests that exercise the write path end-to-end).
+#[expect(dead_code, reason = "reserved for future fs.write E2E tests")]
 fn filesystem_write_config(allowed_root: &str, max_write_bytes: u64) -> Vec<u8> {
     let toml = format!(
         r#"
@@ -490,7 +467,7 @@ async fn execute_rpc_violation_trap_via_grpc() -> Result<()> {
     let resp = client.execute(Request::new(req)).await?;
 
     // Should fail with FAILED_PRECONDITION (traversal trap from sandbox)
-    assert_eq!(resp.get_ref().success, false, "traversal should fail");
+    assert!(!resp.get_ref().success, "traversal should fail");
     eprintln!("Actual error message: '{}'", resp.get_ref().error_message);
     assert!(
         resp.get_ref().error_message.contains("traversal")
@@ -510,7 +487,7 @@ async fn execute_rpc_violation_trap_via_grpc() -> Result<()> {
     let resp = client.execute(Request::new(req)).await?;
 
     // Should fail with FAILED_PRECONDITION (size exceed trap from sandbox)
-    assert_eq!(resp.get_ref().success, false, "size exceed should fail");
+    assert!(!resp.get_ref().success, "size exceed should fail");
     assert!(
         resp.get_ref().error_message.contains("size")
             || resp.get_ref().error_message.contains("exceed")
@@ -559,11 +536,7 @@ async fn execute_rpc_signing_failure_via_grpc() -> Result<()> {
     let req = execute_request("filesystem.read", safe_config.clone(), safe_wasm.clone());
 
     let resp = client.execute(Request::new(req)).await?;
-    assert_eq!(
-        resp.get_ref().success,
-        true,
-        "first execution should succeed"
-    );
+    assert!(resp.get_ref().success, "first execution should succeed");
 
     // Now force a signing failure on the shared ReceiptEmitter
     // This uses the test-only method exposed by the "test-utils" feature
@@ -579,9 +552,8 @@ async fn execute_rpc_signing_failure_via_grpc() -> Result<()> {
     // The Execute handler should catch the signing error and return INTERNAL
     // via gRPC success=false with error message
     eprintln!("Actual error message: '{}'", resp2.get_ref().error_message);
-    assert_eq!(
-        resp2.get_ref().success,
-        false,
+    assert!(
+        !resp2.get_ref().success,
         "second execution should fail due to signing failure"
     );
     assert!(
@@ -636,7 +608,7 @@ async fn verify_chain_tampered_receipt_via_grpc() -> Result<()> {
     };
 
     let resp = client.verify_chain(Request::new(req)).await?;
-    assert_eq!(resp.get_ref().valid, false);
+    assert!(!resp.get_ref().valid);
     assert!(!resp.get_ref().error_message.is_empty());
 
     let _ = server._shutdown.send(());
@@ -709,7 +681,7 @@ async fn execute_rpc_happy_path_result_capture() -> Result<()> {
     let resp = client.execute(Request::new(req)).await?;
 
     // Verify ExecuteResponse
-    assert_eq!(resp.get_ref().success, true, "Execute should succeed");
+    assert!(resp.get_ref().success, "Execute should succeed");
     let response_bytes = &resp.get_ref().result;
     assert_eq!(
         response_bytes, expected_content,
@@ -766,7 +738,7 @@ async fn get_receipt_chain_returns_chain() -> Result<()> {
     let wasm1 = wasm_test_modules::safe_read_module();
     let req1 = execute_request("filesystem.read", config1, wasm1);
     let resp1 = client.execute(Request::new(req1)).await?;
-    assert_eq!(resp1.get_ref().success, true);
+    assert!(resp1.get_ref().success);
 
     // Execute second request
     let safe_file2 = test_root.path().join("safe_file2.txt");
@@ -775,7 +747,7 @@ async fn get_receipt_chain_returns_chain() -> Result<()> {
     let wasm2 = wasm_test_modules::safe_read_module();
     let req2 = execute_request("filesystem.read", config2, wasm2);
     let resp2 = client.execute(Request::new(req2)).await?;
-    assert_eq!(resp2.get_ref().success, true);
+    assert!(resp2.get_ref().success);
 
     // Get receipt chain
     let chain_req = GetReceiptChainRequest {};
@@ -837,7 +809,7 @@ async fn verify_chain_valid_via_grpc() -> Result<()> {
     let safe_wasm = wasm_test_modules::safe_read_module();
     let req = execute_request("filesystem.read", safe_config, safe_wasm);
     let resp = client.execute(Request::new(req)).await?;
-    assert_eq!(resp.get_ref().success, true);
+    assert!(resp.get_ref().success);
 
     // Get the receipt chain
     let chain_resp = client
@@ -857,9 +829,8 @@ async fn verify_chain_valid_via_grpc() -> Result<()> {
     let verify_resp = client.verify_chain(Request::new(verify_req)).await?;
 
     // Chain should be valid
-    assert_eq!(
+    assert!(
         verify_resp.get_ref().valid,
-        true,
         "Valid chain should verify as true"
     );
     assert!(

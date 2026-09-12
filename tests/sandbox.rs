@@ -373,8 +373,7 @@ fn symlink_escape_traps() {
     let cap = fs_read_capability(tmp.path().to_str().unwrap(), 1_048_576);
 
     // Build WAT that reads the symlink path
-    let wat = format!(
-        r#"
+    let wat = r#"
         (module
           (import "aegis" "fs_read" (func $fs_read (param i32 i32 i32 i32) (result i32)))
           (memory (export "memory") 1)
@@ -385,7 +384,7 @@ fn symlink_escape_traps() {
           )
         )
         "#
-    );
+    .to_string();
 
     let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
         .expect("Failed to create sandbox");
@@ -617,7 +616,7 @@ fn sandbox_with_receipts() -> (Sandbox, ring::signature::Ed25519KeyPair) {
     let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
 
     // Create a separate keypair for the emitter
-    let rng2 = ring::rand::SystemRandom::new();
+    let _rng2 = ring::rand::SystemRandom::new();
     let pkcs8_2 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let emitter_key = Ed25519KeyPair::from_pkcs8(pkcs8_2.as_ref()).unwrap();
 
@@ -829,7 +828,7 @@ fn receipt_s416_signing_failure() {
 
     let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
         .expect("Failed to create sandbox");
-    let mut emitter = aegis::receipts::ReceiptEmitter::new(key_pair);
+    let emitter = aegis::receipts::ReceiptEmitter::new(key_pair);
     sandbox.store_mut().data_mut().receipt_emitter =
         Some(std::sync::Arc::new(std::sync::Mutex::new(emitter)));
 
@@ -1257,7 +1256,7 @@ fn symlink_escape_write_traps() {
     let (mut sandbox, key_pair) = sandbox_with_receipts();
     let pub_key = key_pair.public_key().as_ref().to_vec();
 
-    let wasm = parse_str(&wat).expect("WAT parse failed");
+    let wasm = parse_str(wat).expect("WAT parse failed");
     let instance = sandbox
         .instantiate_with_capabilities(&wasm, &[cap])
         .expect("Module should instantiate");
