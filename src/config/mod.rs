@@ -390,3 +390,190 @@ fn default_config_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/.config/aegis/config.toml", home)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One network.http capability with the given allowed_hosts.
+    fn policy_with_hosts(hosts: Vec<&str>) -> PolicyConfig {
+        PolicyConfig {
+            capabilities: vec![CapabilityDef::NetworkHttp {
+                allowed_hosts: hosts.into_iter().map(str::to_string).collect(),
+                allowed_methods: vec!["GET".to_string()],
+                max_requests_per_second: 10,
+            }],
+            receipts: None,
+        }
+    }
+
+    /// One network.http capability with the given allowed_methods.
+    fn policy_with_methods(methods: Vec<&str>) -> PolicyConfig {
+        PolicyConfig {
+            capabilities: vec![CapabilityDef::NetworkHttp {
+                allowed_hosts: vec!["example.com".to_string()],
+                allowed_methods: methods.into_iter().map(str::to_string).collect(),
+                max_requests_per_second: 10,
+            }],
+            receipts: None,
+        }
+    }
+
+    /// One network.http capability with the given rate.
+    fn policy_with_rate(rate: u64) -> PolicyConfig {
+        PolicyConfig {
+            capabilities: vec![CapabilityDef::NetworkHttp {
+                allowed_hosts: vec!["example.com".to_string()],
+                allowed_methods: vec!["GET".to_string()],
+                max_requests_per_second: rate,
+            }],
+            receipts: None,
+        }
+    }
+
+    // ═══ E-601: validation rejects empty / non-hostname allowlist entries ═══
+
+    #[test]
+    fn network_http_empty_allowed_hosts_rejected_e601() {
+        let err = policy_with_hosts(vec![])
+            .validate()
+            .expect_err("empty allowed_hosts must be rejected (E-601)");
+        assert!(
+            matches!(err, ConfigError::MissingField { ref capability, ref field }
+                if capability == "network.http" && field == "allowed_hosts"),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn network_http_empty_allowed_methods_rejected_e601() {
+        let err = policy_with_methods(vec![])
+            .validate()
+            .expect_err("empty allowed_methods must be rejected (E-601)");
+        assert!(
+            matches!(err, ConfigError::MissingField { ref capability, ref field }
+                if capability == "network.http" && field == "allowed_methods"),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn network_http_zero_rate_rejected_e601() {
+        let err = policy_with_rate(0)
+            .validate()
+            .expect_err("zero rate must be rejected (E-601)");
+        assert!(
+            matches!(err, ConfigError::MissingField { ref capability, ref field }
+                if capability == "network.http" && field == "max_requests_per_second (> 0)"),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn network_http_ipv4_literal_rejected_e601() {
+        let err = policy_with_hosts(vec!["127.0.0.1"])
+            .validate()
+            .expect_err("IPv4 literal must be rejected (E-601, REQ-602)");
+        assert!(
+            matches!(err, ConfigError::InvalidHost { ref capability, ref host }
+                if capability == "network.http" && host == "127.0.0.1"),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn network_http_ipv6_literal_rejected_e601() {
+        let err = policy_with_hosts(vec!["::1"])
+            .validate()
+            .expect_err("IPv6 literal must be rejected (E-601, REQ-602)");
+        assert!(
+            matches!(err, ConfigError::InvalidHost { ref capability, ref host }
+                if capability == "network.http" && host == "::1"),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn network_http_bracketed_ipv6_rejected_e601() {
+        let err = policy_with_hosts(vec!["[::1]"])
+            .validate()
+            .expect_err("bracketed IPv6 literal must be rejected (E-601, REQ-602)");
+        assert!(
+            matches!(err, ConfigError::InvalidHost { ref capability, ref host }
+                if capability == "network.http" && host == "[::1]"),
+            "got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn network_http_wildcard_host_rejected_e601() {
+        let err = policy_with_hosts(vec!["*.example.com"])
+            .validate()
+            .expect_err("wildcard host must be rejected (E-601, REQ-602)");
+        assert!(
+            matches!(err, ConfigError::InvalidHost { ref capability, ref host }
+                if capability == "network.http" && host == "*.example.com"),
+            "got: {:?}",
+            err
+        );
+    }
+
+    // ═══ Normalization: hosts → lowercase, methods → uppercase (task 1.5) ═══
+
+    #[test]
+    fn network_http_normalizes_hosts_and_methods() {
+        let cfg = PolicyConfig {
+            capabilities: vec![CapabilityDef::NetworkHttp {
+                allowed_hosts: vec!["EXAMPLE.com".to_string(), "Sub.Example.Org".to_string()],
+                allowed_methods: vec!["get".to_string(), "POST".to_string()],
+                max_requests_per_second: 10,
+            }],
+            receipts: None,
+        }
+        .try_into_capabilities()
+        .expect("valid network.http must convert");
+
+        match &cfg[0] {
+            Capability::NetworkHttp(params) => {
+                assert_eq!(params.allowed_hosts, vec!["example.com", "sub.example.org"]);
+                assert_eq!(params.allowed_methods, vec!["GET", "POST"]);
+            }
+            other => panic!("expected NetworkHttp, got: {:?}", other),
+        }
+    }
+
+    // ═══ REQ-601: `allowed_methods` defaults to ["GET"] when absent ═══
+
+    #[test]
+    fn network_http_methods_default_to_get_in_toml() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("net_http_default_methods.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[capabilities]]
+name = "network.http"
+allowed_hosts = ["example.com"]
+max_requests_per_second = 10
+"#,
+        )
+        .expect("write config");
+
+        let caps = PolicyConfig::load(path.to_str().expect("path"))
+            .expect("defaults must load")
+            .try_into_capabilities()
+            .expect("convert");
+        match &caps[0] {
+            Capability::NetworkHttp(params) => {
+                assert_eq!(params.allowed_methods, vec!["GET"], "REQ-601 default");
+            }
+            other => panic!("expected NetworkHttp, got: {:?}", other),
+        }
+    }
+}
