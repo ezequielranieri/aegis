@@ -6,15 +6,20 @@
 //! - S-603 DNS/connect failures, S-604 stalls, S-605 1 MiB cap, S-606 rate limit
 //! - E-603 port 8443 trap, E-604 exact 1 MiB succeeds, E-605 2/1 burst
 //! - REQ-609 fetch receipts (success + every trap path, signed + chain-verifiable)
-//! - REQ-610 execute-level mapping via real gRPC (trap) and sandbox-level D5
-//!   contract (success triple) — see `network_execute_req610_success_triple`.
+//! - REQ-610 execute-level mapping via REAL gRPC (trap arm AND success arm —
+//!   the success triple is driven through the handler's AEGIS_TEST_MODE-gated
+//!   transport-env hook, see `network_execute_req610_success_via_grpc`) plus
+//!   the sandbox-level D5 contract (`network_execute_req610_success_triple`).
 //!
 //! The TLS stub is an rcgen CA + `localhost` server certificate served by a
 //! tokio-rustls acceptor on an ephemeral port (design.md §Testing Strategy).
 //! The `test-utils` sandbox override (`network_test_port` + `network_test_ca_pem`)
 //! redirects only the transport socket — URL-policy validation is unchanged.
+//! Sandbox-level tests inject it directly (`point_at_stub`); the gRPC E2E tests
+//! inject it through the handler via `AEGIS_TEST_NETWORK_PORT`/`AEGIS_TEST_CA_PEM`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -260,16 +265,44 @@ enum StubMode {
     /// Reply `200 OK` with the given body once the request head arrives.
     Respond(Vec<u8>),
     /// Accept the connection, read the request, then never respond — the
-    /// client's global timeout (5s) must fire (S-604).
+    /// client's global timeout (5s) must fire (S-604, total stage).
     Stall,
+    /// Accept the TCP connection but NEVER complete the TLS handshake —
+    /// the client's connect timeout (2s) must fire during handshake
+    /// establishment (S-604, connect stage). Bounded: closes after 3s.
+    StallHandshake,
+}
+
+/// Serializes gRPC tests that set `AEGIS_TEST_NETWORK_PORT` /
+/// `AEGIS_TEST_CA_PEM` against tests that rely on `AEGIS_TEST_MODE` alone.
+/// Env vars are process-global, so `network_execute_traps_via_grpc` (S-603
+/// relies on localhost:443 being refused, i.e. NO transport override active)
+/// must never run while the override env is set.
+static GRPC_NETWORK_ENV_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+async fn grpc_network_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    GRPC_NETWORK_ENV_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 /// An rcgen CA + `localhost`-certificate HTTPS stub on an ephemeral port.
 struct TlsStub {
     addr: SocketAddr,
     ca_pem: Vec<u8>,
+    /// Accepted TCP connections so far — proves a fetch really reached the
+    /// stub (REQ-610 success E2E scenario evidence).
+    requests: Arc<AtomicUsize>,
     shutdown: Option<oneshot::Sender<()>>,
     handle: JoinHandle<anyhow::Result<()>>,
+}
+
+impl TlsStub {
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for TlsStub {
@@ -323,6 +356,8 @@ async fn spawn_stub(mode: StubMode) -> Result<TlsStub> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_loop = Arc::clone(&requests);
 
     let handle = tokio::spawn(async move {
         loop {
@@ -333,11 +368,24 @@ async fn spawn_stub(mode: StubMode) -> Result<TlsStub> {
                         Ok(socket) => socket,
                         Err(_) => continue,
                     };
+                    requests_loop.fetch_add(1, Ordering::SeqCst);
                     let acceptor = acceptor.clone();
                     let mode = mode.clone();
                     tokio::spawn(async move {
-                        if let Ok(tls) = acceptor.accept(tcp).await {
-                            handle_conn(tls.into(), mode).await
+                        match mode {
+                            // S-604 connect stage: keep the TCP connection open
+                            // without ever completing the TLS handshake — ureq
+                            // runs handshake establishment under
+                            // `Timeout::Connect`, so the 2s connect timeout
+                            // fires while the ClientHello is unanswered.
+                            StubMode::StallHandshake => {
+                                tokio::time::sleep(Duration::from_secs(3)).await;
+                            }
+                            mode => {
+                                if let Ok(tls) = acceptor.accept(tcp).await {
+                                    handle_conn(tls.into(), mode).await
+                                }
+                            }
                         }
                     });
                 }
@@ -349,6 +397,7 @@ async fn spawn_stub(mode: StubMode) -> Result<TlsStub> {
     Ok(TlsStub {
         addr,
         ca_pem: ca_cert.pem().into_bytes(),
+        requests,
         shutdown: Some(shutdown_tx),
         handle,
     })
@@ -385,6 +434,9 @@ async fn handle_conn(mut tls: tokio_rustls::TlsStream<tokio::net::TcpStream>, mo
             // Hold the connection open without ever completing the response.
             tokio::time::sleep(Duration::from_secs(20)).await;
         }
+        // Unreachable — the accept loop filters StallHandshake before the TLS
+        // accept; kept only for match exhaustiveness.
+        StubMode::StallHandshake => {}
     }
 }
 
@@ -513,6 +565,34 @@ async fn network_stall_timeout_s604() -> Result<()> {
         .call(sandbox.store_mut(), ())
         .expect_err("S-604 must trap");
     assert_network_trap(&err, "network timeout: total > 5s");
+
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "one trap receipt (REQ-609)");
+    assert_fetch_receipt(&chain, 0, "https://localhost/x", 0, "trap", &pub_key);
+
+    Ok(())
+}
+
+/// S-604 connect-stage disjunct: the stub ACCEPTS the TCP connection but
+/// never completes the TLS handshake. ureq performs handshake establishment
+/// under `Timeout::Connect`, so the 2s connect timeout fires (bounded: the
+/// test completes in ~2s wall, the stub closes after 3s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_connect_stage_timeout_s604() -> Result<()> {
+    let stub = spawn_stub(StubMode::StallHandshake).await?;
+    let (mut sandbox, cap, key_pair) = network_sandbox(&["localhost"], &["GET"], 10);
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+    point_at_stub(&mut sandbox, &stub);
+
+    let func = instantiate_start(
+        &mut sandbox,
+        &cap,
+        &http_fetch_wat("GET", "https://localhost/x", 1024, 1),
+    );
+    let err = func
+        .call(sandbox.store_mut(), ())
+        .expect_err("S-604 connect stage must trap");
+    assert_network_trap(&err, "network timeout: connect > 2s");
 
     let chain = sandbox.get_receipt_chain();
     assert_eq!(chain.len(), 1, "one trap receipt (REQ-609)");
@@ -938,6 +1018,12 @@ fn execute_request(
 /// signed trap receipt (fetch + execute) in the chain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_execute_traps_via_grpc() -> Result<()> {
+    // Exclude the transport-override env vars: S-603 below relies on
+    // localhost:443 being refused, which breaks if a transport override is
+    // active (even one leftover from a failed sibling test).
+    let _env_guard = grpc_network_env_guard().await;
+    std::env::remove_var("AEGIS_TEST_NETWORK_PORT");
+    std::env::remove_var("AEGIS_TEST_CA_PEM");
     enable_test_mode();
     let certs = GrpcCerts::generate()?;
     let config = create_test_config(&certs, 50071);
@@ -996,21 +1082,107 @@ async fn network_execute_traps_via_grpc() -> Result<()> {
     Ok(())
 }
 
-/// REQ-610 success contract: the D5 `FetchRecord` captured by a REAL fetch
-/// through the stub carries exactly the execute-level receipt triple —
-/// `path` = the fetched URL, `result` = BLAKE3(body) hex, `size` = body byte
-/// length. The gRPC handler arm (D5) passes these three fields straight
-/// through to the execute receipt (`Some(fetch) => (fetch.url,
-/// fetch.body_blake3, fetch.body_len)`), so this pins the data contract that
-/// arm consumes.
-///
-/// Deviation note: the handler constructs its sandbox internally and
-/// `AEGIS_TEST_MODE` is the only test hook it reads — the `test-utils`
-/// transport override lives on `SandboxState` and is unreachable from a
-/// handler-created sandbox without modifying `src/grpc/handlers/mod.rs`
-/// (out of scope per the WU 4 boundary). The trap half of REQ-610 is proven
-/// over real gRPC above; the success triple is proven at the D5 data level
-/// against a real fetch.
+/// REQ-610 SUCCESS arm over REAL gRPC + mTLS (the full handler path): the
+/// handler-created sandbox receives the `test-utils` transport override via
+/// the AEGIS_TEST_MODE-gated env hook (`AEGIS_TEST_NETWORK_PORT` +
+/// `AEGIS_TEST_CA_PEM`, `src/grpc/handlers/mod.rs` — compiled only under the
+/// `test-utils` feature), so a REAL successful fetch is driven through the
+/// Execute boundary. Asserts the execute receipt chain ends with the REQ-610
+/// triple: `path` = the URL actually fetched, `result` = BLAKE3(body) hex,
+/// `size` = body bytes; `success == true`; the response embeds the chain's
+/// last receipt; and the stub request counter proves the fetch really went
+/// through the TLS stub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_execute_req610_success_via_grpc() -> Result<()> {
+    // Serialize with `network_execute_traps_via_grpc`: env vars are
+    // process-global and the trap test's S-603 case relies on localhost:443
+    // being refused (no transport override active).
+    let _env_guard = grpc_network_env_guard().await;
+    enable_test_mode();
+
+    let body = b"stub body for req610 grpc e2e".to_vec();
+    let stub = spawn_stub(StubMode::Respond(body.clone())).await?;
+    let ca_temp = TempDir::new()?;
+    let ca_pem_path = ca_temp.path().join("network-test-ca.pem");
+    std::fs::write(&ca_pem_path, &stub.ca_pem)?;
+    std::env::set_var("AEGIS_TEST_NETWORK_PORT", stub.addr.port().to_string());
+    std::env::set_var("AEGIS_TEST_CA_PEM", &ca_pem_path);
+
+    let certs = GrpcCerts::generate()?;
+    let config = create_test_config(&certs, 50072);
+    let (server, emitter) = TestServer::start_with_emitter(config).await?;
+    let mut client = create_client(&certs, server.addr()).await?;
+
+    let req = execute_request(
+        "network.http",
+        network_http_config(&["localhost"], 10),
+        parse_str(http_fetch_execute_wat("GET", "https://localhost/ok", 1024))?,
+    );
+    let resp = client.execute(Request::new(req)).await?.into_inner();
+    assert!(
+        resp.success,
+        "REQ-610 success arm must succeed through the gRPC boundary"
+    );
+    assert!(resp.error_message.is_empty(), "no error message on success");
+    assert_eq!(
+        resp.result, body,
+        "execute result bytes must be the fetched body"
+    );
+
+    // REQ-610 triple on the LAST (execute) receipt: path = actually-fetched
+    // URL, result = BLAKE3(body) hex, size = body bytes.
+    let expected_hash = blake3::hash(&body).to_hex().to_string();
+    let chain = { emitter.lock().expect("emitter lock").chain().to_vec() };
+    assert_eq!(chain.len(), 2, "fetch receipt + execute receipt");
+    assert_eq!(chain[0].action, "fetch");
+    assert_eq!(chain[0].path, "https://localhost/ok");
+    assert_eq!(chain[0].size, body.len() as u64);
+    assert_eq!(chain[0].result, expected_hash);
+    assert_eq!(chain[1].action, "execute");
+    assert_eq!(
+        chain[1].path, "https://localhost/ok",
+        "execute receipt path = fetched URL (REQ-610)"
+    );
+    assert_eq!(
+        chain[1].result, expected_hash,
+        "execute receipt result = BLAKE3(body) hex (REQ-610)"
+    );
+    assert_eq!(
+        chain[1].size,
+        body.len() as u64,
+        "execute receipt size = body bytes (REQ-610)"
+    );
+
+    // The response embeds the exact execute receipt from the shared chain.
+    assert_eq!(
+        resp.receipt,
+        serde_json::to_vec(chain.last().expect("execute receipt"))?,
+        "ExecuteResponse.receipt must serialize the chain's last receipt"
+    );
+
+    let key_pair = load_receipt_keypair(&certs.signing_key_path())?;
+    let public_key = key_pair.public_key().as_ref().to_vec();
+    ReceiptChain::verify_chain(&chain, &public_key).expect("success chain must verify (REQ-609)");
+
+    // Scenario proof: the fetch really traversed the TLS stub.
+    assert_eq!(
+        stub.requests(),
+        1,
+        "the E2E fetch must hit the TLS stub exactly once"
+    );
+
+    std::env::remove_var("AEGIS_TEST_NETWORK_PORT");
+    std::env::remove_var("AEGIS_TEST_CA_PEM");
+    let _ = server._shutdown.send(());
+    Ok(())
+}
+
+/// REQ-610 success contract at the D5 data level: the `FetchRecord` captured
+/// by a REAL fetch through the stub carries exactly the execute-level receipt
+/// triple — `path` = the fetched URL, `result` = BLAKE3(body) hex, `size` =
+/// body byte length. This pins the data contract the handler arm consumes
+/// (`Some(fetch) => (fetch.url, fetch.body_blake3, fetch.body_len)`); the
+/// full Execute-boundary E2E is `network_execute_req610_success_via_grpc`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_execute_req610_success_triple() -> Result<()> {
     let body = b"stub body for req610".to_vec();
