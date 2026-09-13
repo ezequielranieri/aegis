@@ -9,12 +9,24 @@
 
 pub mod capabilities;
 pub mod config;
+pub mod grpc;
 pub mod observability;
 pub mod policy;
 pub mod receipts;
 pub mod sandbox;
 
+/// Generated protobuf code from `proto/aegis/v1/aegis.proto`
+#[allow(clippy::result_large_err)]
+pub mod proto {
+    pub mod aegis {
+        pub mod v1 {
+            tonic::include_proto!("aegis.v1");
+        }
+    }
+}
+
 pub use config::{CapabilityDef, ConfigError, PolicyConfig, ReceiptsConfig};
+pub use config::runtime::{RuntimeConfig, ServerConfig, TlsConfig, ExecutionConfig};
 pub use sandbox::{
     load_receipt_keypair, CapabilityConfig, EpochInterrupter, Sandbox, SandboxConfig,
 };

@@ -26,7 +26,7 @@ Custom host function `aegis::fs_read` enabling WASM modules to read files from a
 | REQ-205 | System SHALL update `Sandbox::instantiate_with_capabilities(&[Capability])` to iterate enum variants and register host functions per variant using `capability_name()` | MUST |
 | REQ-206 | **REGRESSION GATE**: All 18 Phase 1 tests MUST pass after the typed enum refactor — zero test failures permitted | MUST |
 
-### REQ-101: Host Function Signature
+### Requirement: REQ-101 — Host Function Signature
 
 The host function SHALL be registered via `Linker::func_wrap::<SandboxState, (i32, i32, i32, i32), i32>`:
 
@@ -38,29 +38,59 @@ The host function SHALL be registered via `Linker::func_wrap::<SandboxState, (i3
 | `out_len` | i32 | Capacity of output buffer |
 | Return | i32 | 0 = success, trap on error |
 
-### REQ-102: Path Validation
+### Requirement: REQ-102 — Path Validation
 
 System SHALL canonicalize both the guest-provided path and `allowed_root`, then verify the resolved path starts with the resolved `allowed_root`.
 
-### REQ-103: Traversal Rejection
+### Requirement: REQ-103 — Traversal Rejection
 
 System SHALL reject any path containing `..` segments BEFORE canonicalization. Canonicalize must not resolve `..` out of the root.
 
-### REQ-104: Size Enforcement
+### Requirement: REQ-104 — Size Enforcement
 
-System SHALL call `std::fs::metadata(path)` before reading. If `len > max_read_bytes`: trap. Default `max_read_bytes` = 1,048,576 (1 MB).
+System SHALL call `std::fs::metadata(path)` before reading. If `len > max_bytes`: trap. Default `max_bytes` = 1,048,576 (1 MB).
+(Previously: field name was `max_read_bytes`)
 
-### REQ-105: No FD Table
+#### Scenario: S-5 — Size exceeded
+
+- GIVEN file within `allowed_root` with size > `max_bytes`
+- WHEN module calls `aegis::fs_read`
+- THEN trap raised with message indicating file size exceeds capability limit
+
+#### Scenario: S-1 — Happy path (unchanged)
+
+- GIVEN file within `allowed_root`, size ≤ `max_bytes`
+- WHEN module calls `aegis::fs_read`
+- THEN returns file contents, no trap
+
+### Requirement: REQ-105 — No FD Table
 
 System SHALL NOT expose file descriptors to WASM modules. The host function reads files internally. There is no fd namespace, no fd passing, no fd inheritance. Attempting to use a raw fd number traps.
 
-### REQ-106: Capability-Driven Registration (Updated in Phase 2)
+### Requirement: REQ-106 — Capability-Driven Registration (Updated in Phase 2)
 
 `Sandbox::instantiate_with_capabilities(wasm_bytes, capabilities)` SHALL iterate `&[Capability]` typed enum. For each `Capability::FilesystemRead(params)`, register `aegis::fs_read` using `capability_name()` and `params.allowed_root`/`params.max_read_bytes`. Phase 2 changed `Capability` from `{ name: String, params: HashMap<String, Value> }` to a typed enum.
 
-### REQ-107: Fail-Closed Violations
+### Requirement: REQ-107 — Fail-Closed Violations
 
 Every access control and resource violation MUST trap with `Trap::new(message)`. The system SHALL NOT return error codes, errno values, or graceful failure indicators.
+
+### Requirement: REQ-204 — CapabilityConfig from Enum
+
+System SHALL update `CapabilityConfig::from(&Capability)` to `match` on enum variants. For `FilesystemRead`, populate `name = "filesystem.read"`, `allowed_root`, `max_bytes`. For `FilesystemWrite`, populate `name = "filesystem.write"`, `allowed_root`, `max_bytes` (from `max_write_bytes`).
+(Previously: field was `max_read_bytes`)
+
+#### Scenario: CapabilityConfig from FilesystemRead
+
+- GIVEN `Capability::FilesystemRead(FilesystemReadParams { allowed_root: "/tmp", max_read_bytes: 512 })`
+- WHEN `CapabilityConfig::from(&cap)` called
+- THEN config has `name = "filesystem.read"`, `max_bytes = 512`
+
+#### Scenario: CapabilityConfig from FilesystemWrite
+
+- GIVEN `Capability::FilesystemWrite(FilesystemWriteParams { allowed_root: "/data", max_write_bytes: 2048 })`
+- WHEN `CapabilityConfig::from(&cap)` called
+- THEN config has `name = "filesystem.write"`, `max_bytes = 2048`
 
 ## Scenarios
 
@@ -111,96 +141,102 @@ Every access control and resource violation MUST trap with `Trap::new(message)`.
 
 ## Phase 3: Mature Receipts — Delta
 
-### REQ-400: ExecutionReceipt Structure
+### Requirement: REQ-400 — ExecutionReceipt Structure
 System SHALL define `ExecutionReceipt` with fields: `capability_name`, `action`, `result`, `prev_hash: [u8; 32]`, `signature: [u8; 64]`, `timestamp_ns: u64`.
 
-### REQ-401: Canonical JSON Serialization
+### Requirement: REQ-401 — Canonical JSON Serialization
 System SHALL serialize receipts via canonical JSON (`serde_json`) using struct field declaration order — NO `serde_cbor`.
 
-### REQ-402: Reject Missing Fields
+### Requirement: REQ-402 — Reject Missing Fields
 System SHALL reject any receipt missing required fields.
 
-### REQ-403: Deterministic Serialization
+### Requirement: REQ-403 — Deterministic Serialization
 System SHALL produce identical byte output when serializing the same `ExecutionReceipt` twice.
 
-### REQ-410: BLAKE3 Hash Chain
+### Requirement: REQ-410 — BLAKE3 Hash Chain
 System SHALL use BLAKE3 (`blake3` crate) for content hashing — no SHA-256.
 
-### REQ-411: prev_hash Linkage
+### Requirement: REQ-411 — prev_hash Linkage
 Each receipt's `prev_hash` SHALL equal `blake3(prev_hash ‖ canonical_bytes)`.
 
-### REQ-412: Genesis prev_hash
+### Requirement: REQ-412 — Genesis prev_hash
 Genesis receipt SHALL have `prev_hash = [0u8; 32]`.
 
-### REQ-420: Load Ed25519KeyPair from key_path
+### Requirement: REQ-420 — Load Ed25519KeyPair from key_path
 System SHALL load `Ed25519KeyPair` from `PolicyConfig.receipts.key_path` at sandbox creation.
 
-### REQ-421: ReceiptsConfig in PolicyConfig
+### Requirement: REQ-421 — ReceiptsConfig in PolicyConfig
 `PolicyConfig` SHALL include optional `[receipts]` section with `key_path` field.
 
-### REQ-422: Reuse Phase 2 Fallback Chain
+### Requirement: REQ-422 — Reuse Phase 2 Fallback Chain
 System SHALL reuse Phase 2 fallback chain + `ConfigError` fail-closed for key loading.
 
-### REQ-423: Key File 0600 Permissions
+### Requirement: REQ-423 — Key File 0600 Permissions
 Key file MUST have `0600` permissions — sandbox creation SHALL fail with `ConfigError::Io` otherwise.
 
-### REQ-424: No Auto-Generation
+### Requirement: REQ-424 — No Auto-Generation
 System SHALL NOT auto-generate keys — fail-closed if key file missing or invalid.
 
-### REQ-425: Key Persistence
+### Requirement: REQ-425 — Key Persistence
 Key SHALL persist across restarts for verifiable runtime identity.
 
-### REQ-426: Windows Unsupported
+### Requirement: REQ-426 — Windows Unsupported
 Platform scope: `aegis` currently targets Unix-like platforms only. Key file `0600` permission check uses `std::os::unix::fs::PermissionsExt`. On non-Unix platforms (e.g., Windows), `Sandbox::new` SHALL fail immediately with `ConfigError::Io` ("unsupported platform") — no permission check is attempted, no warning log is emitted.
 
-### REQ-430: ReceiptEmitter in SandboxState
+### Requirement: REQ-430 — ReceiptEmitter in SandboxState
 System SHALL store `ReceiptEmitter` in `SandboxState`.
 
-### REQ-431: ReceiptEmitter Holds Key Pair + Chain
+### Requirement: REQ-431 — ReceiptEmitter Holds Key Pair + Chain
 `ReceiptEmitter` SHALL hold `Ed25519KeyPair` + `ReceiptChain`.
 
-### REQ-432: emit() Creates Signed Receipt
+### Requirement: REQ-432 — emit() Creates Signed Receipt
 `emit(capability, action, path, size, result) -> Result<ExecutionReceipt>` SHALL create signed receipt.
 
-### REQ-433: Fail-Closed Signing Failure
+### Requirement: REQ-433 — Fail-Closed Signing Failure
 Signing failure SHALL propagate as error, never produce unsigned receipt. If `emit()` returns `Err`, the calling host function MUST immediately return `Trap` with the error, discarding original operation result. Uniform across all 5 scenarios.
 
-### REQ-440: Receipt Emission via caller.data_mut()
+### Requirement: REQ-440 — Receipt Emission via caller.data_mut()
 System SHALL access `ReceiptEmitter` via `caller.data_mut()` instead of `emit_capability_event`. The `aegis_fs_read` host function calls `caller.data_mut().receipt_emitter.as_mut()?.emit(capability, action, path, size, result)` at all validation points.
 
-### REQ-441: Receipt Emission for All 5 Scenarios
+### Requirement: REQ-441 — Receipt Emission for All 5 Scenarios
 Receipt emission SHALL occur for all 5 scenarios: S-1 (happy), S-2 (denied), S-3 (traversal), S-4 (fd leak — N/A, no receipt), S-5 (size exceeded). S-4 excluded — module fails at linking before host function runs.
 
-### REQ-450: ReceiptChain::verify_chain Library Function
+### Requirement: REQ-450 — ReceiptChain::verify_chain Library Function
 `ReceiptChain::verify_chain(receipts: &[ExecutionReceipt], public_key: &[u8]) -> Result<()>` SHALL be a library function.
 
-### REQ-451: Ed25519 Signature Validation
+### Requirement: REQ-451 — Ed25519 Signature Validation
 Verifier SHALL validate Ed25519 signature over canonical bytes.
 
-### REQ-452: Hash Chain Integrity Validation
+### Requirement: REQ-452 — Hash Chain Integrity Validation
 Verifier SHALL validate hash chain integrity (`prev_hash` linkage).
 
-### REQ-453: Timestamp Window Validation
+### Requirement: REQ-453 — Timestamp Window Validation
 Verifier SHALL reject timestamps outside ±5s window from current time.
 
-### REQ-454: Optional CLI Verifier
+### Requirement: REQ-454 — Optional CLI Verifier
 Optional CLI verifier (`aegis-verify` binary) MAY wrap `verify_chain`.
 
-### REQ-460: S-1 Happy Path Receipt
+### Requirement: REQ-460 — S-1 Happy Path Receipt
 `aegis_fs_read` SHALL emit mature receipt for S-1 (happy path) with `result = "success"`.
 
-### REQ-461: S-2 Path Traversal Receipt
+### Requirement: REQ-461 — S-2 Path Traversal Receipt
 `aegis_fs_read` SHALL emit mature receipt for S-2 (path traversal) with `result = "trap"`.
 
-### REQ-462: S-3 Size Exceeded Receipt
+### Requirement: REQ-462 — S-3 Size Exceeded Receipt
 `aegis_fs_read` SHALL emit mature receipt for S-3 (size exceeded) with `result = "trap"`.
 
-### REQ-463: S-5 Guest OOB Receipt
+### Requirement: REQ-463 — S-5 Guest OOB Receipt
 `aegis_fs_read` SHALL emit mature receipt for S-5 (WASI unknown import) with `result = "trap"`.
 
-### REQ-464: Regression Gate — 5 Phase 1 Receipt Tests
-All 5 Phase 1 receipt tests (S-1 through S-5) MUST pass after replacement. Tests verify `ExecutionReceipt` fields (capability_name, action, result, path, size, prev_hash, signature, timestamp_ns) with Ed25519 signature verification. S-4 is a pure regression (0 receipts).
+### Requirement: REQ-464 — Regression Gate (Unit A)
 
+All 71 existing tests SHALL pass after the `max_read_bytes` → `max_bytes` rename. Zero test failures permitted.
+
+#### Scenario: Full regression
+
+- GIVEN codebase with `max_bytes` rename applied
+- WHEN `cargo test` executed
+- THEN all 71 tests pass, zero failures
 ## Phase 3 Scenarios
 
 | # | Scenario | Given | When | Then |

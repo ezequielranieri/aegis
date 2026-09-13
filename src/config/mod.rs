@@ -4,6 +4,8 @@
 //! with capability definitions. Fail-closed: no default capabilities when
 //! config is missing or invalid.
 
+pub mod runtime;
+
 use std::path::PathBuf;
 
 use crate::capabilities::{Capability, FilesystemReadParams};

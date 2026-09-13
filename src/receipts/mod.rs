@@ -1,7 +1,7 @@
 //! Signed execution receipts with hash-chaining
 
 use anyhow::Result;
-use ring::signature::{self, Ed25519KeyPair};
+use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -270,6 +270,13 @@ impl ReceiptEmitter {
     /// Get a reference to the receipt chain.
     pub fn chain(&self) -> &[ExecutionReceipt] {
         &self.receipts
+    }
+
+    /// Return the Ed25519 public key bytes.
+    ///
+    /// The private key is never exported — only the 32-byte public component is returned.
+    pub fn public_key(&self) -> Vec<u8> {
+        self.key_pair.public_key().as_ref().to_vec()
     }
 }
 

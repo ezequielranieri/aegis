@@ -96,5 +96,9 @@ System SHALL log `capability: "filesystem.read"`, `path: String`, `size: u64`, `
 | REQ-102, REQ-107 | AC-2: Denied read traps |
 | REQ-103, REQ-107 | AC-3: Path traversal traps |
 | REQ-105, REQ-107 | AC-4: FD leak traps |
-| REQ-104, REQ-107 | AC-5: Size exceeded traps |
+| REQ-104, REQ-107 | AC-4: Size exceeded traps |
 | REQ-108 | Receipt stub logs per call |
+
+## Post-Archive Fix Reference
+
+**AD-006 (2026-09-09)**: Retroactive fix for NUL byte handling in path reading. Guest memory paths include a NUL terminator (`\0`) which `from_utf8` preserved, causing filesystem operations to fail with "unexpected NUL byte". Fixed by trimming trailing NUL bytes after UTF-8 decoding in both `aegis_fs_read` and `aegis_fs_write`. This bug was latent since Phase 1 but only manifested when Phase 3 added `aegis_fs_write` with the same path reading pattern. All 9 original Phase 1 tests pass without modification after the fix. See `DECISIONS.md` AD-006 for full details.
