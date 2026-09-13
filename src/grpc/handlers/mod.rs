@@ -102,7 +102,7 @@ impl AegisRuntime for AegisRuntimeService {
             .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
             .await;
 
-        eprintln!("DEBUG execute: wasm execution result = {:?}", result_bytes);
+        tracing::debug!("DEBUG execute: wasm execution result = {:?}", result_bytes);
 
         match result_bytes {
             Ok(result_bytes) => {
@@ -372,7 +372,7 @@ impl AegisRuntimeService {
             Status::failed_precondition(clean_msg)
         })?;
 
-        eprintln!("DEBUG execute_wasm: ptr={}, len={}", ptr, len);
+        tracing::debug!("DEBUG execute_wasm: ptr={}, len={}", ptr, len);
 
         // Validate ptr/len
         if len < 0 || ptr < 0 {
