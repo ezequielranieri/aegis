@@ -288,6 +288,57 @@ async fn grpc_network_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
         .await
 }
 
+/// RAII guard for the transport-override env vars (`AEGIS_TEST_NETWORK_PORT`,
+/// `AEGIS_TEST_CA_PEM`). Captures the previous state on acquisition and
+/// restores it in `Drop` — unlike manual `remove_var`, it never assumes the
+/// vars were unset before, and it runs even on panic or early return, so a
+/// failed test can never leak a phantom override into the process for a later
+/// sibling test.
+struct TestNetworkEnvGuard {
+    _gate: tokio::sync::MutexGuard<'static, ()>,
+    saved_port: Option<String>,
+    saved_ca: Option<String>,
+}
+
+impl TestNetworkEnvGuard {
+    /// Serializes against the other gRPC env-mutating tests AND snapshots the
+    /// current env state so `Drop` can restore it.
+    async fn acquire() -> Self {
+        let _gate = grpc_network_env_guard().await;
+        Self {
+            _gate,
+            saved_port: std::env::var("AEGIS_TEST_NETWORK_PORT").ok(),
+            saved_ca: std::env::var("AEGIS_TEST_CA_PEM").ok(),
+        }
+    }
+
+    /// Point the handler-created sandbox transport at a test stub.
+    fn set(&self, port: u16, ca_pem_path: &std::path::Path) {
+        std::env::set_var("AEGIS_TEST_NETWORK_PORT", port.to_string());
+        std::env::set_var("AEGIS_TEST_CA_PEM", ca_pem_path);
+    }
+
+    /// Ensure no transport override is active (e.g. the traps test relies on
+    /// localhost:443 being refused — the default, non-overridden transport).
+    fn clear(&self) {
+        std::env::remove_var("AEGIS_TEST_NETWORK_PORT");
+        std::env::remove_var("AEGIS_TEST_CA_PEM");
+    }
+}
+
+impl Drop for TestNetworkEnvGuard {
+    fn drop(&mut self) {
+        match &self.saved_port {
+            Some(p) => std::env::set_var("AEGIS_TEST_NETWORK_PORT", p),
+            None => std::env::remove_var("AEGIS_TEST_NETWORK_PORT"),
+        }
+        match &self.saved_ca {
+            Some(c) => std::env::set_var("AEGIS_TEST_CA_PEM", c),
+            None => std::env::remove_var("AEGIS_TEST_CA_PEM"),
+        }
+    }
+}
+
 /// An rcgen CA + `localhost`-certificate HTTPS stub on an ephemeral port.
 struct TlsStub {
     addr: SocketAddr,
@@ -1021,9 +1072,8 @@ async fn network_execute_traps_via_grpc() -> Result<()> {
     // Exclude the transport-override env vars: S-603 below relies on
     // localhost:443 being refused, which breaks if a transport override is
     // active (even one leftover from a failed sibling test).
-    let _env_guard = grpc_network_env_guard().await;
-    std::env::remove_var("AEGIS_TEST_NETWORK_PORT");
-    std::env::remove_var("AEGIS_TEST_CA_PEM");
+    let _env_guard = TestNetworkEnvGuard::acquire().await;
+    _env_guard.clear();
     enable_test_mode();
     let certs = GrpcCerts::generate()?;
     let config = create_test_config(&certs, 50071);
@@ -1097,7 +1147,7 @@ async fn network_execute_req610_success_via_grpc() -> Result<()> {
     // Serialize with `network_execute_traps_via_grpc`: env vars are
     // process-global and the trap test's S-603 case relies on localhost:443
     // being refused (no transport override active).
-    let _env_guard = grpc_network_env_guard().await;
+    let _env_guard = TestNetworkEnvGuard::acquire().await;
     enable_test_mode();
 
     let body = b"stub body for req610 grpc e2e".to_vec();
@@ -1105,8 +1155,7 @@ async fn network_execute_req610_success_via_grpc() -> Result<()> {
     let ca_temp = TempDir::new()?;
     let ca_pem_path = ca_temp.path().join("network-test-ca.pem");
     std::fs::write(&ca_pem_path, &stub.ca_pem)?;
-    std::env::set_var("AEGIS_TEST_NETWORK_PORT", stub.addr.port().to_string());
-    std::env::set_var("AEGIS_TEST_CA_PEM", &ca_pem_path);
+    _env_guard.set(stub.addr.port(), &ca_pem_path);
 
     let certs = GrpcCerts::generate()?;
     let config = create_test_config(&certs, 50072);
@@ -1171,8 +1220,7 @@ async fn network_execute_req610_success_via_grpc() -> Result<()> {
         "the E2E fetch must hit the TLS stub exactly once"
     );
 
-    std::env::remove_var("AEGIS_TEST_NETWORK_PORT");
-    std::env::remove_var("AEGIS_TEST_CA_PEM");
+    // `_env_guard`'s Drop restores the env vars to their pre-test state.
     let _ = server._shutdown.send(());
     Ok(())
 }
