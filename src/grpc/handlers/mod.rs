@@ -86,6 +86,23 @@ impl AegisRuntime for AegisRuntimeService {
         // 5. Set the shared receipt emitter on the sandbox
         sandbox.store_mut().data_mut().receipt_emitter = Some(self.receipt_emitter.clone());
 
+        // 5b. Test-only transport override injection (REQ-610 E2E). The
+        //     `test-utils` feature is enabled exclusively through the
+        //     dev-dependency `aegis = { path = ".", features = ["test-utils"] }`,
+        //     so this block never compiles into production binaries. Fail-closed:
+        //     the override applies ONLY when test mode is active — a stray
+        //     `AEGIS_TEST_NETWORK_PORT` in a production environment is ignored.
+        #[cfg(feature = "test-utils")]
+        if test_mode {
+            if let Ok(port_str) = std::env::var("AEGIS_TEST_NETWORK_PORT") {
+                let state = sandbox.store_mut().data_mut();
+                state.network_test_port = port_str.parse::<u16>().ok();
+                if let Ok(ca_path) = std::env::var("AEGIS_TEST_CA_PEM") {
+                    state.network_test_ca_pem = std::fs::read(&ca_path).ok();
+                }
+            }
+        }
+
         // 6. Find the matching capability by name
         let matching_cap = capabilities
             .iter()
@@ -102,7 +119,7 @@ impl AegisRuntime for AegisRuntimeService {
             .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
             .await;
 
-        eprintln!("DEBUG execute: wasm execution result = {:?}", result_bytes);
+        tracing::debug!("DEBUG execute: wasm execution result = {:?}", result_bytes);
 
         match result_bytes {
             Ok(result_bytes) => {
@@ -292,8 +309,7 @@ impl AegisRuntimeService {
                         msg.push_str(&source2.to_string());
                     }
                 }
-                eprintln!("DEBUG WASM instantiation error: {}", msg);
-                tracing::error!(error = %e, "failed to instantiate WASM module");
+                tracing::error!(error = %e, chain = %msg, "failed to instantiate WASM module");
                 Status::internal(format!("WASM instantiation failed: {}", e))
             })?;
 
@@ -372,7 +388,7 @@ impl AegisRuntimeService {
             Status::failed_precondition(clean_msg)
         })?;
 
-        eprintln!("DEBUG execute_wasm: ptr={}, len={}", ptr, len);
+        tracing::debug!("DEBUG execute_wasm: ptr={}, len={}", ptr, len);
 
         // Validate ptr/len
         if len < 0 || ptr < 0 {
