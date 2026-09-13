@@ -309,8 +309,7 @@ impl AegisRuntimeService {
                         msg.push_str(&source2.to_string());
                     }
                 }
-                eprintln!("DEBUG WASM instantiation error: {}", msg);
-                tracing::error!(error = %e, "failed to instantiate WASM module");
+                tracing::error!(error = %e, chain = %msg, "failed to instantiate WASM module");
                 Status::internal(format!("WASM instantiation failed: {}", e))
             })?;
 
