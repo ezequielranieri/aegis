@@ -418,3 +418,163 @@ Create `AD-009` to track this. The hardening PR `hardening/grpc-boundary-tests` 
 | `verify_chain_valid_via_grpc` | GetReceiptChain chain passes VerifyChain with valid=true |
 
 **AD-009 STATUS: RESOLVED** — Happy path receipt integrity gap closed. All 90 tests pass. Ready for Phase 5 verify + archive.
+
+---
+
+## AD-010: Host Functions vs WASI
+
+**Date**: 2026-09-11
+**Phase**: 6 (documentation)
+**Status**: Accepted
+
+### Context
+Wasmtime supports WASI (WebAssembly System Interface) as a standardized capability set. The aegis project chose to implement custom host functions (`aegis_fs_read`, `aegis_fs_write`) instead of using WASI preview1 or preview2.
+
+### Decision
+Use custom host functions via `Linker::func_wrap` instead of WASI.
+
+### Rationale
+- **Fine-grained capability control**: WASI provides broad system access (fd_read, fd_write, path_open, etc.) that cannot be easily scoped to a single capability like `filesystem.read` with an `allowed_root`. Custom host functions allow per-capability closures that capture `allowed_root` and `max_bytes` at link time.
+- **Security boundary clarity**: Each host function is explicitly named (`aegis_fs_read`, `aegis_fs_write`) and validated against the capability config before any filesystem operation. WASI's flat fd-based model would require additional authorization layers.
+- **Path validation integration**: Custom functions embed the full path traversal check (`..` rejection, canonicalize + `starts_with` root check, symlink resolution) directly in the host function closure. WASI would require these checks in a separate policy layer.
+- **Receipt emission**: Custom functions emit signed receipts at each validation point (path OOB, traversal, size exceed, success). WASI does not have hooks for receipt emission at the syscall level.
+- **Future extensibility**: Custom host functions can be extended to `network.http`, `crypto.sign`, `crypto.verify` without WASI version compatibility constraints.
+
+### Tradeoffs
+- Not standardized — custom ABI means guest modules must import `aegis` namespace functions
+- WASI modules from the ecosystem cannot run without an adapter layer
+- More implementation effort per capability vs. using existing WASI imports
+
+### Consequences
+- Guest WASM modules must be compiled with `aegis` imports, not WASI imports (the `aegis_fs_read`/`aegis_fs_write` pattern)
+- WASI modules produce linking errors at instantiation (S-4) — this is documented and expected
+- The `Capability` enum maps directly to host function registration, creating a tight coupling between capability grants and host function exports
+
+### Traceability
+- Design: `src/sandbox/mod.rs` `instantiate_with_capabilities()`, `src/capabilities/mod.rs`
+- Spec: All filesystem specs (REQ-101..107, REQ-501..512)
+
+---
+
+## AD-011: test-utils Feature Flag for Signing Failure
+
+**Date**: 2026-09-11
+**Phase**: 6 (documentation)
+**Status**: Accepted
+
+### Context
+The `ReceiptEmitter` needs a mechanism to force signing failures in tests to verify fail-closed behavior (S-416, S-702). This requires a test-only method `force_signing_failure()` that is not available in production builds.
+
+### Decision
+Use a Cargo feature flag `test-utils` to gate `force_signing_failure()` on `ReceiptEmitter`.
+
+### Rationale
+- **Compile-time isolation**: The `#[cfg(feature = "test-utils")]` attribute ensures the `force_signing_failure` field and method are completely absent from release builds. There is zero runtime overhead or attack surface.
+- **Dev-dependency pattern**: The feature is enabled only for `aegis = { path = ".", features = ["test-utils"] }` in `[dev-dependencies]`. Production users who depend on `aegis` without this feature get a clean `ReceiptEmitter` without test hooks.
+- **Explicit intent**: The feature name `test-utils` signals that anything behind it is test infrastructure, not production API. This prevents accidental use in production code.
+- **Alternative considered**: Environment variable `AEGIS_TEST_MODE` (used in `src/grpc/handlers/mod.rs` for epoch interruption) was considered but rejected for `ReceiptEmitter` because env vars are runtime checks, not compile-time guarantees. The feature flag provides stronger isolation.
+
+### Tradeoffs
+- Requires `features = ["test-utils"]` on dev-dependency, adding a small cognitive overhead for new contributors
+- Two code paths (cfg-gated) increase the surface area of `ReceiptEmitter`
+- The `#[cfg(feature = "test-utils")]` pattern must be consistently applied — missed gates could leak test hooks into production
+
+### Consequences
+- `cargo test` automatically enables `test-utils` via dev-dependency
+- `cargo build --release` does not include test hooks
+- `force_signing_failure()` is the only test-only method on `ReceiptEmitter`; all other methods are production-ready
+
+### Traceability
+- Source: `Cargo.toml` `[features] test-utils = []`, `src/receipts/mod.rs` `#[cfg(feature = "test-utils")]` blocks
+- Tests: `receipt_emitter_signing_failure_forced`, `execute_rpc_signing_failure_via_grpc`
+
+---
+
+## AD-012: mTLS over Plain TLS
+
+**Date**: 2026-09-11
+**Phase**: 6 (documentation)
+**Status**: Accepted
+
+### Context
+The gRPC boundary requires TLS for transport security. The project chose mutual TLS (mTLS) with client certificate validation over plain TLS (server-only authentication).
+
+### Decision
+Require mTLS with CN/SAN client certificate validation (`AegisClientCertVerifier`) for all gRPC connections.
+
+### Rationale
+- **Mutual authentication**: Plain TLS only authenticates the server to the client. mTLS authenticates both parties — the server presents its cert, the client must present a cert signed by the configured CA with CN/SAN matching `expected_identity`. This is essential for the agent-gateway (Go) ↔ aegis-runtime (Rust) boundary where the caller identity must be verified.
+- **Fail-closed by default**: `client_auth_mandatory()` returns `true` — connections without valid client certificates are rejected with `UNAUTHENTICATED`. There is no "optional mTLS" mode.
+- **CN/SAN validation**: The custom `AegisClientCertVerifier` checks both Common Name (`CN=agent-gateway`) and Subject Alternative Names (DNS/URI) against `RuntimeConfig.tls.expected_identity`. This provides defense-in-depth: even if a CA issues a cert with only CN, SAN must also match; and vice versa.
+- **Configurable identity**: The expected identity is not hardcoded — it's `expected_identity` in `TlsConfig`, allowing different environments (dev/staging/prod) to use different caller identities.
+- **Plain TLS was rejected**: Plain TLS would allow any client with a valid CA-signed cert to connect, including unauthorized agent-gateway instances or malicious actors who obtain a CA-signed cert.
+
+### Tradeoffs
+- Certificate management complexity: requires CA, server cert, client cert for every deployment
+- mTLS handshake adds latency (~1-2ms) to every gRPC call
+- Certificate rotation requires coordination between client and server
+- The `AegisClientCertVerifier` parses X.509 certs manually using `x509-parser` — potential fragility if cert formats change
+
+### Consequences
+- Every `aegis-runtime` deployment requires CA cert, server cert/key, and client cert/key configured in `RuntimeConfig`
+- The `grpc_boundary.rs` integration tests generate ephemeral certs via `rcgen` to test mTLS
+- If TLS is not configured (`config.server.tls = None`), the server warns but still starts — this is a known gap (no enforcement that mTLS is required in production)
+
+### Traceability
+- Source: `src/grpc/tls.rs` `AegisClientCertVerifier`, `src/config/runtime.rs` `TlsConfig`, `src/grpc/server.rs` `build_tonic_tls_config`
+- Spec: REQ-713, REQ-716
+
+---
+
+## AD-013: Scope Creep Cuts (Q6)
+
+**Date**: 2026-09-11
+**Phase**: 6 (documentation)
+**Status**: Accepted
+
+### Context
+Phase 6 was originally scoped to include several features beyond documentation. Through the SDD process, these were cut to maintain focus and avoid introducing new implementation risks after Phase 5's close-call with false PASSes.
+
+### Decision
+Phase 6 is documentation-only. All implementation features are deferred to future phases.
+
+### Items Cut from Q6 Scope
+1. **`network.http` capability implementation** — Requires async HTTP client integration, URL validation, rate limiting. Deferred because it introduces new failure modes (network timeouts, DNS resolution) not covered by existing sandbox patterns.
+2. **WASI compatibility layer** — Would allow existing WASI modules to run in aegis. Requires WASI host implementation or adapter. Deferred because it conflicts with the custom host function approach (AD-010) and would dilute the capability-based security model.
+3. **Fuel metering** — Was deferred from Phase 0 (AD-002) as "Phase 1+". Still not implemented because epoch-only interruption is sufficient for current security requirements. Fuel metering adds per-instruction overhead and complexity without strengthening the security boundary.
+4. **Two-phase receipt emission** — Proposed as a fix for the S-416-W-after-rename gap (AD-005). Requires a pending/receipt-commit protocol or external KMS with atomicity. Deferred because the current audit log + fail-closed trap approach is adequate for the threat model.
+5. **GPU/compute capability** — Not in any spec. Would require Wasmtime host function for compute shaders. Deferred entirely — no spec exists.
+
+### Rationale
+- Phase 5 had 3 false PASSes (see Retrospective below) — introducing new implementation now risks repeating verification failures
+- The documentation phase should solidify the architecture decisions before adding new capabilities
+- Each deferred item has a clear reason for deferral and can be explored individually in future phases
+
+### Consequences
+- Phase 6 produces only documentation artifacts (explore.md, ADRs, threat model, retrospective)
+- `network.http` remains a capability variant in `Capability` enum but has no host function implementation
+- Fuel metering remains deferred; epoch-only continues as the CPU limit mechanism
+- The S-416 receipt gap remains documented but unfixed (mitigated by audit log)
+
+### Traceability
+- Related: AD-002 (fuel metering deferred), AD-005 (S-416 receipt gap), AD-010 (host functions vs WASI)
+
+---
+
+## Traceability
+
+| Decision | Spec Req | Design Section | Implementation |
+|----------|----------|----------------|----------------|
+| AD-001 | REQ-003, REQ-007 | Decision: Store Limits | `StoreLimitsBuilder::trap_on_grow_failure(true)` |
+| AD-002 | REQ-001, REQ-006 | Decision: Engine Config | `Config::epoch_interruption(true)`, no fuel |
+| AD-003 | REQ-004 | Decision: Epoch Timer | `EpochInterrupter::new()` with mpsc channel |
+| AD-004 | REQ-003, REQ-004 | Testing isolation | `Sandbox::new_with_config(config, enable_epoch: bool)` |
+| AD-005 | REQ-510 | S-416-W-after-rename gap | `aegis_fs_write` trap + audit log after rename |
+| AD-006 | REQ-503, REQ-512 | Symlink traversal + NUL byte fix | `aegis_fs_write` symlink `..` check + NUL trim |
+| AD-007 | REQ-701, REQ-702, REQ-704, REQ-714, REQ-715 | gRPC boundary failure tests (explicit debt) | Documented in AD-007; follow-up hardening PR required |
+| AD-008 | REQ-714, REQ-715 | Execute RPC stub invalidation | Phase 5 closure retroactively invalidated |
+| AD-009 | REQ-701, REQ-708, S-700 | Execute RPC result capture | Guest memory read at `result_ptr/len` |
+| AD-010 | REQ-101..107, REQ-501..512 | Host functions vs WASI | `Linker::func_wrap` custom host functions |
+| AD-011 | REQ-433, S-416, S-702 | test-utils feature flag | `#[cfg(feature = "test-utils")]` on `ReceiptEmitter` |
+| AD-012 | REQ-713, REQ-716 | mTLS over plain TLS | `AegisClientCertVerifier` with CN/SAN |
+| AD-013 | Phase 6 scope | Scope creep cuts | `network.http`, WASI, fuel, two-phase emission deferred |
