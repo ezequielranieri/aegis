@@ -969,6 +969,7 @@ fn capability_config_from_filesystem_write() {
 fn capability_config_from_network_http() {
     let cap = Capability::NetworkHttp(NetworkHttpParams {
         allowed_hosts: vec!["example.com".to_string()],
+        allowed_methods: vec!["GET".to_string()],
         max_requests_per_second: 100,
     });
 
@@ -995,6 +996,7 @@ fn capability_name_filesystem_write() {
 fn capability_name_network_http() {
     let net_http = Capability::NetworkHttp(NetworkHttpParams {
         allowed_hosts: vec!["example.com".to_string()],
+        allowed_methods: vec!["GET".to_string()],
         max_requests_per_second: 50,
     });
     assert_eq!(net_http.capability_name(), "network.http");

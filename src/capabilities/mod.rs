@@ -34,7 +34,14 @@ pub struct FilesystemWriteParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkHttpParams {
     pub allowed_hosts: Vec<String>,
+    #[serde(default = "default_allowed_methods")]
+    pub allowed_methods: Vec<String>,
     pub max_requests_per_second: u64,
+}
+
+/// Serde default for `allowed_methods` — GET-only unless configured (REQ-601).
+pub fn default_allowed_methods() -> Vec<String> {
+    vec!["GET".to_string()]
 }
 
 impl Capability {

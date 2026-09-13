@@ -8,7 +8,7 @@ pub mod runtime;
 
 use std::path::PathBuf;
 
-use crate::capabilities::{Capability, FilesystemReadParams};
+use crate::capabilities::{default_allowed_methods, Capability, FilesystemReadParams};
 use serde::de::Error as SerdeError;
 
 /// Configuration parsed from a TOML config file (REQ-302)
@@ -43,6 +43,8 @@ pub enum CapabilityDef {
     #[serde(rename = "network.http")]
     NetworkHttp {
         allowed_hosts: Vec<String>,
+        #[serde(default = "default_allowed_methods")]
+        allowed_methods: Vec<String>,
         max_requests_per_second: u64,
     },
 }
@@ -67,6 +69,9 @@ pub enum ConfigError {
 
     #[error("Invalid path '{path}' for capability '{capability}'")]
     InvalidPath { capability: String, path: String },
+
+    #[error("Invalid host '{host}' for capability '{capability}'")]
+    InvalidHost { capability: String, host: String },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -235,12 +240,28 @@ impl PolicyConfig {
                 }
                 CapabilityDef::NetworkHttp {
                     allowed_hosts,
+                    allowed_methods,
                     max_requests_per_second,
                 } => {
                     if allowed_hosts.is_empty() {
                         return Err(ConfigError::MissingField {
                             capability: "network.http".to_string(),
                             field: "allowed_hosts".to_string(),
+                        });
+                    }
+                    // Fail-closed: exact hostname only — no IP literals, no wildcards (REQ-602).
+                    for host in allowed_hosts {
+                        if is_invalid_host(host) {
+                            return Err(ConfigError::InvalidHost {
+                                capability: "network.http".to_string(),
+                                host: host.clone(),
+                            });
+                        }
+                    }
+                    if allowed_methods.is_empty() {
+                        return Err(ConfigError::MissingField {
+                            capability: "network.http".to_string(),
+                            field: "allowed_methods".to_string(),
                         });
                     }
                     if *max_requests_per_second == 0 {
@@ -324,15 +345,44 @@ impl CapabilityDef {
             }
             CapabilityDef::NetworkHttp {
                 allowed_hosts,
+                allowed_methods,
                 max_requests_per_second,
             } => Ok(Capability::NetworkHttp(
                 crate::capabilities::NetworkHttpParams {
-                    allowed_hosts,
+                    allowed_hosts: allowed_hosts
+                        .into_iter()
+                        .map(|h| h.to_lowercase())
+                        .collect(),
+                    allowed_methods: allowed_methods
+                        .into_iter()
+                        .map(|m| m.to_uppercase())
+                        .collect(),
                     max_requests_per_second,
                 },
             )),
         }
     }
+}
+
+/// Fail-closed host check (REQ-602): `allowed_hosts` entries must be DNS
+/// hostnames matched exactly — IP literals (IPv4/IPv6, bare or bracketed) and
+/// wildcard entries are rejected.
+fn is_invalid_host(host: &str) -> bool {
+    // No wildcards — exact hostname matching only
+    if host.contains('*') {
+        return true;
+    }
+    // Bare IPv4/IPv6 literals, e.g. "1.2.3.4", "::1"
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    // Bracketed IPv6 literal from URL notation, e.g. "[::1]"
+    if host.starts_with('[') && host.ends_with(']') {
+        if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+            return inner.parse::<std::net::IpAddr>().is_ok();
+        }
+    }
+    false
 }
 
 /// Resolve the fallback config path: `~/.config/aegis/config.toml`
