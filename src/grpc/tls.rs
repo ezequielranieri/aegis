@@ -6,10 +6,10 @@
 
 use std::sync::Arc;
 
+use rustls::client::danger::HandshakeSignatureValid;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, Error, RootCertStore, ServerConfig, SignatureScheme};
-use rustls::client::danger::HandshakeSignatureValid;
 
 use crate::config::runtime::TlsConfig;
 
@@ -77,17 +77,15 @@ impl ClientCertVerifier for AegisClientCertVerifier {
                 cn = %cn,
                 "client certificate identity mismatch"
             );
-            return Err(Error::InvalidCertificate(
-                rustls::CertificateError::Other(rustls::OtherError(Arc::new(
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "client certificate identity mismatch: expected '{}'",
-                            self.expected_identity
-                        ),
+            return Err(Error::InvalidCertificate(rustls::CertificateError::Other(
+                rustls::OtherError(Arc::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "client certificate identity mismatch: expected '{}'",
+                        self.expected_identity
                     ),
                 ))),
-            ));
+            )));
         }
 
         Ok(ClientCertVerified::assertion())
@@ -172,9 +170,9 @@ pub fn build_tls_config(tls_config: &TlsConfig) -> anyhow::Result<ServerConfig> 
 
     // Build root certificate store
     let mut root_store = RootCertStore::empty();
-    root_store.add(ca_cert_der).map_err(|e| {
-        anyhow::anyhow!("failed to add CA cert to root store: {}", e)
-    })?;
+    root_store
+        .add(ca_cert_der)
+        .map_err(|e| anyhow::anyhow!("failed to add CA cert to root store: {}", e))?;
 
     // Create the custom client cert verifier
     let verifier = AegisClientCertVerifier {
@@ -183,14 +181,13 @@ pub fn build_tls_config(tls_config: &TlsConfig) -> anyhow::Result<ServerConfig> 
     };
 
     // Build server config with mTLS
-    let config = ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(|e| anyhow::anyhow!("TLS protocol config error: {}", e))?
-    .with_client_cert_verifier(Arc::new(verifier))
-    .with_single_cert(vec![server_cert_der], server_key_der)
-    .map_err(|e| anyhow::anyhow!("TLS cert/key error: {}", e))?;
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("TLS protocol config error: {}", e))?
+            .with_client_cert_verifier(Arc::new(verifier))
+            .with_single_cert(vec![server_cert_der], server_key_der)
+            .map_err(|e| anyhow::anyhow!("TLS cert/key error: {}", e))?;
 
     Ok(config)
 }
