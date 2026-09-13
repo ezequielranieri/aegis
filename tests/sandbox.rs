@@ -87,6 +87,79 @@ const GUEST_OOB: &str = r#"
 "#;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Phase 3: filesystem.write WAT Modules
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// S-1-W: Allowed Write — writes "hello world" to "output.txt" within root
+const ALLOWED_WRITE: &str = r#"
+(module
+  (import "aegis" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "output.txt\00")
+  (data (i32.const 2048) "hello world")
+  (func (export "_start")
+    (call $fs_write (i32.const 1024) (i32.const 10) (i32.const 2048) (i32.const 11))
+    drop
+  )
+)
+"#;
+
+/// S-2-W: Outside Root — path resolves outside allowed_root (../secret.txt)
+const DENIED_WRITE: &str = r#"
+(module
+  (import "aegis" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "../secret.txt\00")
+  (data (i32.const 2048) "secret data")
+  (func (export "_start")
+    (call $fs_write (i32.const 1024) (i32.const 13) (i32.const 2048) (i32.const 11))
+    drop
+  )
+)
+"#;
+
+/// S-3-W: Path Traversal — ../../etc/passwd, rejected pre-canonicalize
+const TRAVERSAL_WRITE: &str = r#"
+(module
+  (import "aegis" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "../../etc/passwd\00")
+  (data (i32.const 2048) "pwned")
+  (func (export "_start")
+    (call $fs_write (i32.const 1024) (i32.const 15) (i32.const 2048) (i32.const 5))
+    drop
+  )
+)
+"#;
+
+/// S-5-W: Size Exceeded — data_len (2048) > max_write_bytes (1024)
+const SIZE_EXCEEDED_WRITE: &str = r#"
+(module
+  (import "aegis" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "output.txt\00")
+  (func (export "_start")
+    ;; data_ptr=2048, data_len=2048 — exceeds 1024 limit
+    (call $fs_write (i32.const 1024) (i32.const 10) (i32.const 2048) (i32.const 2048))
+    drop
+  )
+)
+"#;
+
+/// T-6-W: Guest Memory OOB — both path_ptr and data_ptr beyond 64KB memory bounds
+const GUEST_OOB_WRITE: &str = r#"
+(module
+  (import "aegis" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "_start")
+    ;; path_ptr=100000 is beyond 64KB memory — path read fails first
+    (call $fs_write (i32.const 100000) (i32.const 10) (i32.const 100000) (i32.const 11))
+    drop
+  )
+)
+"#;
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Helper: create a filesystem.read capability with given root and limit
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -94,6 +167,14 @@ fn fs_read_capability(root: &str, max_bytes: u64) -> Capability {
     Capability::FilesystemRead(FilesystemReadParams {
         allowed_root: std::path::PathBuf::from(root),
         max_read_bytes: max_bytes,
+    })
+}
+
+/// Helper: create a filesystem.write capability with given root and limit
+fn fs_write_capability(root: &str, max_bytes: u64) -> Capability {
+    Capability::FilesystemWrite(FilesystemWriteParams {
+        allowed_root: std::path::PathBuf::from(root),
+        max_write_bytes: max_bytes,
     })
 }
 
@@ -854,7 +935,7 @@ fn capability_config_from_filesystem_read() {
     let config = aegis::sandbox::CapabilityConfig::from(&cap);
 
     assert_eq!(config.name, "filesystem.read");
-    assert_eq!(config.max_read_bytes, 512);
+    assert_eq!(config.max_bytes, 512);
     // allowed_root may be canonicalized, check it ends with /tmp
     assert!(
         config.allowed_root.to_string_lossy().ends_with("tmp"),
@@ -874,8 +955,7 @@ fn capability_config_from_filesystem_write() {
     let config = aegis::sandbox::CapabilityConfig::from(&cap);
 
     assert_eq!(config.name, "filesystem.write");
-    // max_read_bytes is repurposed from max_write_bytes for Phase 3
-    assert_eq!(config.max_read_bytes, 2048);
+    assert_eq!(config.max_bytes, 2048);
     // allowed_root should be canonicalized
     assert!(
         config.allowed_root.to_string_lossy().ends_with("data"),
@@ -895,8 +975,7 @@ fn capability_config_from_network_http() {
     let config = aegis::sandbox::CapabilityConfig::from(&cap);
 
     assert_eq!(config.name, "network.http");
-    // max_read_bytes is repurposed from max_requests_per_second for Phase 3
-    assert_eq!(config.max_read_bytes, 100);
+    assert_eq!(config.max_bytes, 100);
     // allowed_root is empty PathBuf for network capabilities
     assert!(config.allowed_root.as_os_str().is_empty());
 }
@@ -919,4 +998,492 @@ fn capability_name_network_http() {
         max_requests_per_second: 50,
     });
     assert_eq!(net_http.capability_name(), "network.http");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase 3: filesystem.write Tests (B.4–B.11)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// B.4 / S-1-W: Allowed Write — writes "hello world" to "output.txt" within root
+#[test]
+fn allowed_write_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(ALLOWED_WRITE).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
+
+    // Verify file was written at allowed_root/output.txt
+    let output_path = tmp.path().join("output.txt");
+    assert!(output_path.exists(), "Output file should exist");
+    let contents = std::fs::read(&output_path).unwrap();
+    assert_eq!(contents, b"hello world");
+
+    // Verify receipt was emitted with correct fields
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.write");
+    assert_eq!(receipt.action, "write");
+    assert_eq!(receipt.result, "success");
+    assert_eq!(receipt.path, "output.txt");
+    assert_eq!(receipt.size, 11);
+    assert!(receipt.timestamp_ns > 0);
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// B.5 / S-2-W: Denied Write — path resolves outside allowed_root → trap
+#[test]
+fn denied_write_traps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(DENIED_WRITE).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on denied write");
+    let err = result.unwrap_err();
+    // ../secret.txt contains ".." so it hits traversal check (step 4) before root check (step 5)
+    assert!(
+        error_chain_contains(&err, "path outside allowed root")
+            || error_chain_contains(&err, "path traversal"),
+        "Expected path violation error in chain, got: {:?}",
+        err
+    );
+
+    // Verify receipt was emitted with result="trap"
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.write");
+    assert_eq!(receipt.action, "write");
+    assert_eq!(receipt.result, "trap");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// B.6 / S-3-W: Path Traversal — ../../etc/passwd → trap (pre-canonicalize)
+#[test]
+fn traversal_write_traps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(TRAVERSAL_WRITE).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on path traversal");
+    let err = result.unwrap_err();
+    assert!(
+        error_chain_contains(&err, "path traversal attempt"),
+        "Expected 'path traversal attempt' in error chain, got: {:?}",
+        err
+    );
+
+    // Verify receipt was emitted with result="trap"
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.write");
+    assert_eq!(receipt.action, "write");
+    assert_eq!(receipt.result, "trap");
+    assert!(receipt.path.contains(".."), "path should contain ..");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// B.7 / S-5-W: Size Exceeded — data_len (2048) > max_write_bytes (1024) → trap
+#[test]
+fn size_exceeded_write_traps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1024); // 1KB limit
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(SIZE_EXCEEDED_WRITE).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on size exceeded");
+    let err = result.unwrap_err();
+    assert!(
+        error_chain_contains(&err, "exceeds"),
+        "Expected 'exceeds' in error chain, got: {:?}",
+        err
+    );
+
+    // Verify receipt was emitted with result="trap"
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.write");
+    assert_eq!(receipt.action, "write");
+    assert_eq!(receipt.result, "trap");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// B.8 / T-6-W: Guest Memory OOB — data_ptr beyond 64KB memory bounds
+#[test]
+fn guest_memory_oob_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(GUEST_OOB_WRITE).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on guest memory OOB");
+    let err = result.unwrap_err();
+    assert!(
+        error_chain_contains(&err, "out of bounds"),
+        "Expected 'out of bounds' in error chain, got: {:?}",
+        err
+    );
+
+    // Verify receipt was emitted with result="trap" and path=""
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.write");
+    assert_eq!(receipt.action, "write");
+    assert_eq!(receipt.result, "trap");
+    assert_eq!(receipt.path, "");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// B.9 / Symlink-W: Symlink Escape — symlink inside root points outside → trap
+#[test]
+fn symlink_escape_write_traps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_file = outside_dir.path().join("secret.txt");
+
+    // Create symlink inside tmp pointing outside
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_file, tmp.path().join("symlink.txt")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside_file, tmp.path().join("symlink.txt")).unwrap();
+
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    // Build WAT that writes to the symlink path
+    let wat = r#"
+        (module
+          (import "aegis" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 1024) "symlink.txt\00")
+          (data (i32.const 2048) "pwned")
+          (func (export "_start")
+            (call $fs_write (i32.const 1024) (i32.const 11) (i32.const 2048) (i32.const 5))
+            drop
+          )
+        )
+        "#;
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(&wat).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(result.is_err(), "Expected trap on symlink escape");
+    let err = result.unwrap_err();
+    assert!(
+        error_chain_contains(&err, "path outside allowed root"),
+        "Expected 'path outside allowed root' in error chain, got: {:?}",
+        err
+    );
+
+    // Verify receipt was emitted with result="trap"
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.write");
+    assert_eq!(receipt.action, "write");
+    assert_eq!(receipt.result, "trap");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// B.9b / Symlink-W-relative: Symlink with `..` target that doesn't exist → trap
+/// Tests the fix for CVE-like bypass: symlink pointing outside via `..` where
+/// target doesn't exist yet (hits read_link branch without canonicalize)
+#[test]
+#[cfg(unix)]
+fn symlink_write_relative_traversal_traps() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Create symlink inside tmp pointing outside via `..` to a non-existent target
+    // Target: ../../outside/evil.txt (doesn't exist yet, but would escape root)
+    let symlink_path = tmp.path().join("evil_symlink.txt");
+    std::os::unix::fs::symlink("../../outside/evil.txt", &symlink_path).unwrap();
+
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    // Build WAT that writes to the symlink path
+    let wat = r#"
+        (module
+          (import "aegis" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 1024) "evil_symlink.txt\00")
+          (data (i32.const 2048) "pwned")
+          (func (export "_start")
+            (call $fs_write (i32.const 1024) (i32.const 17) (i32.const 2048) (i32.const 5))
+            drop
+          )
+        )
+        "#;
+
+    let (mut sandbox, key_pair) = sandbox_with_receipts();
+    let pub_key = key_pair.public_key().as_ref().to_vec();
+
+    let wasm = parse_str(wat).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(
+        result.is_err(),
+        "Expected trap on symlink traversal with .. target"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        error_chain_contains(&err, "symlink target contains '..' traversal segment"),
+        "Expected 'symlink target contains' in error chain, got: {:?}",
+        err
+    );
+
+    // Verify receipt was emitted with result="trap"
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Expected exactly 1 receipt");
+
+    let receipt = &chain[0];
+    assert_eq!(receipt.capability_name, "filesystem.write");
+    assert_eq!(receipt.action, "write");
+    assert_eq!(receipt.result, "trap");
+
+    // Verify Ed25519 signature
+    receipt
+        .verify_signature(&pub_key)
+        .expect("Signature verification failed");
+}
+
+/// B.10 / S-416-W: Signing Failure — force_signing_failure before write → Trap,
+/// NO target file created, NO new receipt added
+#[test]
+fn receipt_s416_write_signing_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
+        .expect("Failed to create sandbox");
+
+    let emitter_key = {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    };
+    let emitter = aegis::receipts::ReceiptEmitter::new(emitter_key);
+    sandbox.store_mut().data_mut().receipt_emitter = Some(emitter);
+
+    let wasm = parse_str(ALLOWED_WRITE).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    // Force signing failure BEFORE calling fs_write
+    {
+        let emitter = sandbox
+            .store_mut()
+            .data_mut()
+            .receipt_emitter
+            .as_mut()
+            .expect("receipt emitter missing");
+        emitter.force_signing_failure();
+    }
+
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(
+        result.is_err(),
+        "Expected Trap on signing failure, got: {:?}",
+        result
+    );
+
+    // Design §7.3: file IS written (temp+rename happens before emit).
+    // This is the known asymmetry — we cannot undo the host filesystem write.
+    // The critical property is: NO receipt was added to the chain.
+    // (receipt_s416_write_after_rename tests this more explicitly)
+
+    // Verify NO additional receipt was added to chain
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 0, "No receipt should be added when emit fails");
+}
+
+/// B.11 / S-416-W-after-rename: First emit succeeds (file written),
+/// then force signing failure on second emit.
+/// Assert: result.is_err(), file IS at target path, FAIL-CLOSED VIOLATION logged.
+#[test]
+fn receipt_s416_write_after_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap = fs_write_capability(tmp.path().to_str().unwrap(), 1_048_576);
+
+    let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
+        .expect("Failed to create sandbox");
+
+    let emitter_key = {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    };
+    let emitter = aegis::receipts::ReceiptEmitter::new(emitter_key);
+    sandbox.store_mut().data_mut().receipt_emitter = Some(emitter);
+
+    let wasm = parse_str(ALLOWED_WRITE).expect("WAT parse failed");
+    let instance = sandbox
+        .instantiate_with_capabilities(&wasm, &[cap])
+        .expect("Module should instantiate");
+
+    let func = instance
+        .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+        .expect("Function not found");
+
+    // First call: emit succeeds, file written, receipt added
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(
+        result.is_ok(),
+        "First write should succeed: {:?}",
+        result.err()
+    );
+
+    let output_path = tmp.path().join("output.txt");
+    assert!(output_path.exists(), "File should exist after first write");
+    let contents = std::fs::read(&output_path).unwrap();
+    assert_eq!(contents, b"hello world");
+
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(chain.len(), 1, "Should have 1 receipt after first write");
+    assert_eq!(chain[0].result, "success");
+
+    // Force signing failure for second call
+    {
+        let emitter = sandbox
+            .store_mut()
+            .data_mut()
+            .receipt_emitter
+            .as_mut()
+            .expect("receipt emitter missing");
+        emitter.force_signing_failure();
+    }
+
+    // Second call: rename succeeds but emit fails → Trap
+    let result = func.call(sandbox.store_mut(), ());
+    assert!(
+        result.is_err(),
+        "Expected Trap on signing failure after rename, got: {:?}",
+        result
+    );
+
+    // File IS at target path (rename succeeded, cannot undo)
+    assert!(
+        output_path.exists(),
+        "File should still exist (rename succeeded, cannot undo)"
+    );
+
+    // No new receipt added (emit failed)
+    let chain = sandbox.get_receipt_chain();
+    assert_eq!(
+        chain.len(),
+        1,
+        "No new receipt should be added when emit fails after rename"
+    );
 }

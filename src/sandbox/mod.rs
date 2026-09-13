@@ -50,22 +50,22 @@ impl Default for SandboxConfig {
     }
 }
 
-/// Configuration for a filesystem.read capability grant.
+/// Configuration for a capability grant (filesystem.read, filesystem.write, etc.).
 ///
-/// Captures the allowed root directory and maximum read size for a
-/// single `filesystem.read` capability. Built from a `Capability` via
+/// Captures the allowed root directory and maximum size for a
+/// single capability. Built from a `Capability` via
 /// `From<&Capability>`.
 ///
-/// **Fail-closed invariant**: all paths outside `allowed_root` or reads
-/// exceeding `max_read_bytes` produce a trap (REQ-107).
+/// **Fail-closed invariant**: all paths outside `allowed_root` or operations
+/// exceeding `max_bytes` produce a trap (REQ-107).
 #[derive(Debug, Clone)]
 pub struct CapabilityConfig {
-    /// Capability name (e.g., "filesystem.read").
+    /// Capability name (e.g., "filesystem.read", "filesystem.write").
     pub name: String,
     /// Canonicalized absolute path that serves as the root boundary.
     pub allowed_root: PathBuf,
-    /// Maximum file size in bytes that may be read (default: 1 MB).
-    pub max_read_bytes: u64,
+    /// Maximum size in bytes for this capability (default: 1 MB).
+    pub max_bytes: u64,
 }
 
 impl From<&Capability> for CapabilityConfig {
@@ -75,18 +75,18 @@ impl From<&Capability> for CapabilityConfig {
                 name: "filesystem.read".to_string(),
                 allowed_root: std::fs::canonicalize(&params.allowed_root)
                     .unwrap_or_else(|_| params.allowed_root.clone()),
-                max_read_bytes: params.max_read_bytes,
+                max_bytes: params.max_read_bytes,
             },
             Capability::FilesystemWrite(params) => Self {
                 name: "filesystem.write".to_string(),
                 allowed_root: std::fs::canonicalize(&params.allowed_root)
                     .unwrap_or_else(|_| params.allowed_root.clone()),
-                max_read_bytes: params.max_write_bytes,
+                max_bytes: params.max_write_bytes,
             },
             Capability::NetworkHttp(params) => Self {
                 name: "network.http".to_string(),
                 allowed_root: PathBuf::new(),
-                max_read_bytes: params.max_requests_per_second,
+                max_bytes: params.max_requests_per_second,
             },
         }
     }
@@ -349,7 +349,7 @@ impl Sandbox {
     ///
     /// For each `filesystem.read` capability, registers `aegis::fs_read`
     /// via `Linker::func_wrap` with the capability's `allowed_root` and
-    /// `max_read_bytes` captured in the closure.
+    /// `max_bytes` captured in the closure.
     ///
     /// **Fail-closed invariant**: all violation paths (path escape,
     /// traversal, size exceed, fd leak) produce a `Trap`, never a
@@ -391,7 +391,18 @@ impl Sandbox {
                     )?;
                 }
                 Capability::FilesystemWrite(_) => {
-                    // Phase 3: register fs_write host function
+                    linker.func_wrap(
+                        "aegis",
+                        "fs_write",
+                        move |caller: Caller<'_, SandboxState>,
+                              path_ptr: i32,
+                              path_len: i32,
+                              data_ptr: i32,
+                              data_len: i32|
+                              -> Result<i32> {
+                            aegis_fs_write(caller, path_ptr, path_len, data_ptr, data_len)
+                        },
+                    )?;
                 }
                 Capability::NetworkHttp(_) => {
                     // Phase 3: register network host functions
@@ -459,7 +470,7 @@ impl Sandbox {
 ///
 /// Registered via `Linker::func_wrap` when `filesystem.read` capability
 /// is present. Validates path against `allowed_root`, rejects `..`
-/// traversal, enforces `max_read_bytes` via `stat()`, reads via
+/// traversal, enforces `max_bytes` via `stat()`, reads via
 /// `std::fs::read`, and traps on ALL violations (fail-closed, REQ-107).
 ///
 /// Phase 3: Each validation point emits a signed execution receipt via
@@ -505,13 +516,15 @@ fn aegis_fs_read(
         }
         anyhow::anyhow!("path_ptr/path_len out of bounds")
     })?;
-    let path =
-        std::str::from_utf8(&path_bytes).map_err(|_| anyhow::anyhow!("invalid UTF-8 in path"))?;
+    let path = std::str::from_utf8(&path_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid UTF-8 in path"))?
+        .trim_end_matches('\0')
+        .to_string();
 
     // 4. REQ-103: Reject .. segments BEFORE canonicalize (T-1, S-3)
     if path.contains("..") {
         if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "read", path, 0, "trap") {
+            if let Err(e) = emitter.emit(&cap_name, "read", &path, 0, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -519,14 +532,14 @@ fn aegis_fs_read(
     }
 
     // 5. REQ-102: Canonicalize and verify within allowed_root (S-2)
-    let full_path = cap.allowed_root.join(path);
+    let full_path = cap.allowed_root.join(&path);
     let canonical_path = std::fs::canonicalize(&full_path)
         .map_err(|_| anyhow::anyhow!("path canonicalization failed"))?;
     let canonical_root = std::fs::canonicalize(&cap.allowed_root)
         .map_err(|_| anyhow::anyhow!("allowed_root canonicalization failed"))?;
     if !canonical_path.starts_with(&canonical_root) {
         if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "read", path, 0, "trap") {
+            if let Err(e) = emitter.emit(&cap_name, "read", &path, 0, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
@@ -537,22 +550,22 @@ fn aegis_fs_read(
     let metadata = std::fs::metadata(&canonical_path)
         .map_err(|_| anyhow::anyhow!("file metadata read failed"))?;
     let file_size = metadata.len();
-    if file_size > cap.max_read_bytes {
+    if file_size > cap.max_bytes {
         if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-            if let Err(e) = emitter.emit(&cap_name, "read", path, file_size, "trap") {
+            if let Err(e) = emitter.emit(&cap_name, "read", &path, file_size, "trap") {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
         }
         bail!(
             "file size {} exceeds capability limit {}",
             file_size,
-            cap.max_read_bytes
+            cap.max_bytes
         );
     }
 
     // 7. Emit receipt for happy path (S-1) BEFORE read
     if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
-        if let Err(e) = emitter.emit(&cap_name, "read", path, file_size, "success") {
+        if let Err(e) = emitter.emit(&cap_name, "read", &path, file_size, "success") {
             return Err(anyhow::anyhow!("receipt emission failed: {}", e));
         }
     }
@@ -569,4 +582,248 @@ fn aegis_fs_read(
         .copy_from_slice(&contents);
 
     Ok(0) // success
+}
+
+/// Host function: atomic filesystem write within an allowed root.
+///
+/// Registered via `Linker::func_wrap` when `filesystem.write` capability
+/// is present. Validates path against `allowed_root`, rejects `..`
+/// traversal, enforces `max_bytes` on data size, writes to a temp file
+/// (`.aegis_tmp`), atomically renames to target, and emits a signed
+/// receipt AFTER rename succeeds (design §5.2).
+///
+/// **Critical invariant**: rename BEFORE success receipt emission.
+/// If emit fails after rename (S-416-W-after-rename), the file IS
+/// written on the host filesystem and cannot be undone. We log
+/// "FAIL-CLOSED VIOLATION" and return Trap at the API level.
+///
+/// **Fail-closed invariant**: all violation paths produce a Trap,
+/// never graceful errors (REQ-107, REQ-510).
+fn aegis_fs_write(
+    mut caller: Caller<'_, SandboxState>,
+    path_ptr: i32,
+    path_len: i32,
+    data_ptr: i32,
+    data_len: i32,
+) -> Result<i32> {
+    // 1. Get capability config FIRST
+    let cap = caller
+        .data()
+        .capabilities
+        .iter()
+        .find(|c| c.name == "filesystem.write")
+        .ok_or_else(|| anyhow::anyhow!("filesystem.write capability not granted"))?
+        .clone();
+    let cap_name = cap.name.clone();
+
+    // 2. Validate guest memory bounds for PATH (T-6-W)
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| anyhow::anyhow!("memory export required"))?;
+
+    // 3. Read path string from guest memory
+    let path_result = {
+        let data = memory.data(&caller);
+        data.get(path_ptr as usize..(path_ptr + path_len) as usize)
+            .map(|bytes| bytes.to_vec())
+    };
+
+    let path_bytes = path_result.ok_or_else(|| {
+        // Guest memory OOB on path — emit trap receipt, then trap
+        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+            if let Err(e) = emitter.emit(&cap_name, "write", "", 0, "trap") {
+                return anyhow::anyhow!("receipt emission failed: {}", e);
+            }
+        }
+        anyhow::anyhow!("path_ptr/path_len out of bounds")
+    })?;
+    let path = std::str::from_utf8(&path_bytes)
+        .map_err(|_| anyhow::anyhow!("invalid UTF-8 in path"))?
+        .trim_end_matches('\0')
+        .to_string();
+
+    // 4. REQ-503: Reject .. segments BEFORE canonicalize (S-3-W)
+    if path.contains("..") {
+        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+            if let Err(e) = emitter.emit(&cap_name, "write", &path, 0, "trap") {
+                return Err(anyhow::anyhow!("receipt emission failed: {}", e));
+            }
+        }
+        bail!("path traversal attempt: '..' segment detected");
+    }
+
+    // 5. REQ-502: Canonicalize and verify within allowed_root (S-2-W, Symlink-W)
+    // For write, the target file may not exist yet. We check for symlinks
+    // explicitly using symlink_metadata (which does NOT follow symlinks),
+    // then resolve via canonicalize if the target exists, or read_link if not.
+    let full_path = cap.allowed_root.join(&path);
+    let canonical_path = {
+        // Check if the path is a symlink — if so, resolve the target
+        let symlink_meta = std::fs::symlink_metadata(&full_path);
+        let is_symlink = symlink_meta
+            .as_ref()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+
+        if is_symlink {
+            // Symlink exists — try canonicalize (resolves to target path)
+            match std::fs::canonicalize(&full_path) {
+                Ok(p) => p,
+                Err(_) => {
+                    // Target doesn't exist — read the raw symlink target
+                    let target = std::fs::read_link(&full_path)
+                        .map_err(|_| anyhow::anyhow!("path canonicalization failed"))?;
+
+                    // REQ-503: Reject symlink targets containing ".." segments — same fail-closed
+                    // traversal check as guest-provided paths. A symlink pointing outside the
+                    // allowed_root via ".." is a traversal attempt regardless of whether the
+                    // target exists yet.
+                    if target.components().any(|c| c.as_os_str() == "..") {
+                        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+                            let _ = emitter.emit(&cap_name, "write", &path, 0, "trap");
+                        }
+                        bail!("symlink target contains '..' traversal segment");
+                    }
+
+                    // Resolve relative symlink targets against the parent directory
+                    if target.is_relative() {
+                        let parent = full_path
+                            .parent()
+                            .ok_or_else(|| anyhow::anyhow!("path has no parent directory"))?;
+                        parent.join(target)
+                    } else {
+                        target
+                    }
+                }
+            }
+        } else {
+            // Not a symlink — file may not exist yet, canonicalize parent
+            let parent = full_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("path has no parent directory"))?;
+            let file_name = full_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("path has no file name"))?;
+            let canonical_parent = std::fs::canonicalize(parent)
+                .map_err(|_| anyhow::anyhow!("path canonicalization failed"))?;
+            canonical_parent.join(file_name)
+        }
+    };
+    let canonical_root = std::fs::canonicalize(&cap.allowed_root)
+        .map_err(|_| anyhow::anyhow!("allowed_root canonicalization failed"))?;
+
+    // REQ-503 / REQ-512: Defense-in-depth — reject any canonical_path that still
+    // contains ".." components (ParentDir). This catches symlink targets with
+    // unresolved ".." that escaped the earlier checks, and any other path
+    // construction that might leave ".." unnormalized.
+    if canonical_path.components().any(|c| c.as_os_str() == "..") {
+        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+            let _ = emitter.emit(&cap_name, "write", &path, 0, "trap");
+        }
+        bail!("path contains '..' after resolution — traversal attempt");
+    }
+
+    if !canonical_path.starts_with(&canonical_root) {
+        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+            if let Err(e) = emitter.emit(&cap_name, "write", &path, 0, "trap") {
+                return Err(anyhow::anyhow!("receipt emission failed: {}", e));
+            }
+        }
+        bail!("path outside allowed root");
+    }
+
+    // 6. Validate guest memory bounds for DATA (T-6-W)
+    let data_result = {
+        let data = memory.data(&caller);
+        data.get(data_ptr as usize..(data_ptr + data_len) as usize)
+            .map(|bytes| bytes.to_vec())
+    };
+
+    let write_data = data_result.ok_or_else(|| {
+        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+            if let Err(e) = emitter.emit(&cap_name, "write", &path, 0, "trap") {
+                return anyhow::anyhow!("receipt emission failed: {}", e);
+            }
+        }
+        anyhow::anyhow!("data_ptr/data_len out of bounds")
+    })?;
+
+    // 7. REQ-504: Size enforcement (S-5-W)
+    let data_size = write_data.len() as u64;
+    if data_size > cap.max_bytes {
+        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+            if let Err(e) = emitter.emit(&cap_name, "write", &path, data_size, "trap") {
+                return Err(anyhow::anyhow!("receipt emission failed: {}", e));
+            }
+        }
+        bail!(
+            "data size {} exceeds capability limit {}",
+            data_size,
+            cap.max_bytes
+        );
+    }
+
+    // 8. Create temp file: target.aegis_tmp in allowed_root
+    let temp_path = canonical_path.with_extension(
+        canonical_path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+            + ".aegis_tmp",
+    );
+    // If no extension, use "filename.aegis_tmp"
+    let temp_path = if temp_path == canonical_path {
+        canonical_path.with_file_name(
+            canonical_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+                + ".aegis_tmp",
+        )
+    } else {
+        temp_path
+    };
+
+    // Write data to temp file
+    std::fs::write(&temp_path, &write_data)
+        .map_err(|_| anyhow::anyhow!("temp file write failed"))?;
+
+    // 9. Atomic rename: temp → target (REQ-505, REQ-506: overwrite allowed)
+    // CRITICAL: Rename BEFORE success receipt emission.
+    if let Err(e) = std::fs::rename(&temp_path, &canonical_path) {
+        // Rename failed — cleanup temp file, emit trap receipt, then trap
+        let _ = std::fs::remove_file(&temp_path);
+        if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+            let _ = emitter.emit(&cap_name, "write", &path, data_size, "trap");
+        }
+        bail!("atomic rename failed: {}", e);
+    }
+
+    // 10. Rename succeeded — file is now visible at target path.
+    // NOW emit success receipt. This is the critical asymmetry vs aegis_fs_read:
+    // In read, we could trap and not return data. In write, the file is ALREADY
+    // written to the host filesystem and visible to other processes. We cannot
+    // "un-write" it. If emit fails HERE, we have a real write without a receipt.
+    if let Some(ref mut emitter) = caller.data_mut().receipt_emitter {
+        if let Err(e) = emitter.emit(&cap_name, "write", &path, data_size, "success") {
+            // S-416-W-after-rename: emit failed AFTER successful rename
+            // File is already written at target — we CANNOT undo it.
+            tracing::error!(
+                "FAIL-CLOSED VIOLATION: filesystem.write succeeded (file at {}) but receipt emission failed: {}. \
+                Host has a write with no signed receipt in chain.",
+                canonical_path.display(), e
+            );
+            // Still return Trap to maintain fail-closed at API level
+            return Err(anyhow::anyhow!(
+                "receipt emission failed after successful write: {}",
+                e
+            ));
+        }
+    }
+
+    // 11. Success — file written AND receipt emitted
+    Ok(0)
 }
