@@ -589,6 +589,10 @@ Adopt the six design decisions D1..D6 from the Phase 7 design as the network cap
 - Output-buffer-too-small now emits a trap receipt (path=URL, size=body.len()) before bailing — closes the AD-005-class audit gap (observed remote fetch with no signed receipt).
 - Reinstates ADR-013 cut item #1 (read-only reference): `openspec/changes/archive/2026-09-11-phase6-documentation/adrs/ADR-013-scope-creep-cuts-q6.md`.
 
+### Implementation Notes (archive closure, 2026-09-12)
+- **Ring-only TLS provider** (final repo state, commit `8b19898`): `rustls = { version = "0.23", default-features = false, features = ["ring","std","tls12","logging"] }` and `tokio-rustls = { default-features = false, features = ["ring","logging","tls12"] }` (Cargo.toml:39-42). aws-lc-rs is eliminated from the dependency graph — `cargo tree -i aws-lc-rs` matches nothing (exit 101). Consequence: the `prefer-post-quantum` feature is dropped (feature-tied to `aws_lc_rs`); D1's "ring matches existing deps" rationale is now faithfully implemented. Previously documented only in a Cargo.toml comment (:35-38).
+- **D4 chain-walk implementation** (`src/grpc/handlers/mod.rs:342-389`): wasmtime 24 wraps host-fn traps in a backtrace frame, so the literal `msg.starts_with("network ")` never fires on the top-level `Display`. The network-first guard walks the error chain via `std::iter::successors(e.source(), ...)` and dispatches on the first frame whose message starts with `network ` (endpoint/method/connection/timeout/response size/rate limit prefixes), structurally isolating all network traps from the fs cascade branches.
+
 ### Consequences
 - Execute-level receipts for performed fetches report the host-recorded `FetchRecord` (URL / BLAKE3(body) / body length, REQ-610); modules that never fetch fall back to the generic values.
 - Network traps surface as gRPC `success=false` (FAILED_PRECONDITION) with clean mapped messages.
@@ -596,8 +600,8 @@ Adopt the six design decisions D1..D6 from the Phase 7 design as the network cap
 - Rollback is scoped: revert the `NetworkHttp` arm to NO-OP + the guard to the fs cascade, delete this AD — no receipt schema change.
 
 ### Traceability
-- Spec: `openspec/changes/phase7-network-http/specs/network-http/spec.md` REQ-601..REQ-610, S-601..S-606
-- Design: `openspec/changes/phase7-network-http/design.md` D1..D6, Data Flow
+- Spec: `openspec/changes/archive/2026-09-12-phase7-network-http/specs/network-http/spec.md` REQ-601..REQ-610, S-601..S-606 (archived 2026-09-12; promoted to `openspec/specs/network-http/spec.md`)
+- Design: `openspec/changes/archive/2026-09-12-phase7-network-http/design.md` D1..D6, Data Flow
 - Tests: `tests/network_http.rs` + `tests/grpc_boundary.rs` REQ-610 E2E (Phase 4)
 - Related: ADR-013 (scope cuts), AD-010 (host functions vs WASI), AD-005 (receipt gap class)
 
