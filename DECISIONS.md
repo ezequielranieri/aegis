@@ -625,3 +625,39 @@ Adopt the six design decisions D1..D6 from the Phase 7 design as the network cap
 | AD-012 | REQ-713, REQ-716 | mTLS over plain TLS | `AegisClientCertVerifier` with CN/SAN |
 | AD-013 | Phase 6 scope | Scope creep cuts | `network.http`, WASI, fuel, two-phase emission deferred |
 | AD-014 | REQ-601..REQ-610, S-601..S-606 | D1..D6 | `aegis_http_fetch` host fn + `FetchRecord`-backed execute receipt |
+| AD-015 | REQ-001, REQ-400, REQ-715, REQ-717, REQ-723 | §3, §4, §6, §7 | `consume_fuel(true)` + `set_fuel` + `fuel_consumed` on Execute receipts |
+---
+
+## AD-015: Fuel Metering via Wasmtime `consume_fuel`
+
+**Date**: 2026-09-14
+**Phase**: 8 (fuel metering)
+**Status**: Accepted
+
+### Context
+Execute receipts lacked any CPU-usage signal; epoch interruption bounds wall-clock but cannot be reported deterministically per execution. The wasmtime-sandbox skill suggested a stale API (`add_fuel`, `fuel_consumed`) that does not exist in wasmtime 24 (Explore #125, design spike R1).
+
+### Decision
+Enable wasmtime `consume_fuel` at engine creation for every sandbox (REQ-001), set an explicit per-execution budget via `store.set_fuel()` — never relying on the default 0 — with a calibration-backed default of 10 M fuel (design spike, Section 6). Report `fuel_consumed` on Execute receipts only (D5), last field, skip-if-zero, byte-identical at 0 (E-802). Classify exhaustion via a dedicated D4 arm (deterministic literal `all fuel consumed`) placed after the network guard and before the fs cascade (D7). Fuel is instruction accounting; epoch interruption remains the wall-clock security boundary (complementary, not exclusive — D1).
+
+### Rationale
+- **Deterministic per-execution CPU accounting in receipts** — operators and verifiers can see exact fuel consumption
+- **S-802 exhaustion classification stable** — the fuel arm catches `all fuel consumed` traps deterministically before epoch
+- **Configs without the knob keep current behavior** (E-804) — default 10 M provides 909,090× headroom over max E2E-shaped execute (11 fuel)
+- **Operators can raise `execution.fuel_budget` for compute-heavy guests** (E-805) — documented knob
+- **Capability receipts deliberately carry 0** (R4) — 23 of 25 emit sites pass 0; only the 2 Execute sites pass fuel
+- **Verifier logic untouched** (R6) — skip-if-zero + last field makes fuel=0 receipts byte-identical to pre-change schema
+
+### Consequences
+- Every sandbox created for execution runs with `consume_fuel(true)` + explicit `set_fuel(budget)` — never relying on store default 0 (REQ-001, E-801)
+- Fuel exhaustion traps are classified as `"fuel budget exceeded"` via dedicated D4 cascade arm (S-802, E-803)
+- `fuel_consumed` field on `ExecutionReceipt` is skip-if-zero, last field, enabling backward-compatible chain verification (E-802)
+- Default budget of 10 M fuel calibrated by spike: 909,090× headroom over max E2E execute (11 fuel); ~770 K arithmetic iterations before exhaustion; deterministic trap at ~7–14 ms (well before 100 ms epoch)
+- Operator knob `execution.fuel_budget: Option<u64>` plumbed from config → service → sandbox (E-804, E-805)
+
+### Traceability
+- Design: `openspec/changes/phase8-fuel-metering/design.md` §3, §4, §6, §7
+- Specs: sandbox-init (REQ-001), receipt-verifier (REQ-400), signed-receipts (REQ-723), grpc-runtime-server (REQ-715, REQ-717)
+- Tests: `tests/fuel.rs` (S-801, S-802, E-803, E-804, E-805), `src/sandbox/mod.rs` (E-801, E-801-inverse), `src/receipts/mod.rs` (E-802, S-803), `src/config/runtime.rs` (E-804, E-805)
+- Precedent: Phase 7 AD-014/D6 (documentation in same work unit as code)
+

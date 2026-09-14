@@ -195,9 +195,16 @@ impl AegisRuntime for AegisRuntimeService {
             }
             Err(status) => {
                 // Emit trap receipt on failure (with fuel_consumed captured post-call)
-                if let Ok(mut emitter) = self.receipt_emitter.lock() {
-                    let _ = emitter.emit(&capability_name, "execute", "", 0, "trap", fuel_consumed);
-                }
+                let trap_receipt = if let Ok(mut emitter) = self.receipt_emitter.lock() {
+                    emitter
+                        .emit(&capability_name, "execute", "", 0, "trap", fuel_consumed)
+                        .ok()
+                } else {
+                    None
+                };
+                let trap_receipt_bytes = trap_receipt
+                    .map(|r| serde_json::to_vec(&r).expect("receipt serialization should not fail"))
+                    .unwrap_or_default();
 
                 // For capability violations (traversal, size exceed) and signing failures,
                 // return success=false instead of gRPC error status, per REQ-715 / S-701, S-702
@@ -207,7 +214,7 @@ impl AegisRuntime for AegisRuntimeService {
                     Ok(Response::new(ExecuteResponse {
                         success: false,
                         result: Vec::new(),
-                        receipt: Vec::new(),
+                        receipt: trap_receipt_bytes,
                         error_message: status.message().to_string(),
                     }))
                 } else {
