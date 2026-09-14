@@ -669,7 +669,7 @@ fn aegis_fs_read(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "read", "", 0, "trap")
+                .emit(&cap_name, "read", "", 0, "trap", 0)
             {
                 return anyhow::anyhow!("receipt emission failed: {}", e);
             }
@@ -687,7 +687,7 @@ fn aegis_fs_read(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "read", &path, 0, "trap")
+                .emit(&cap_name, "read", &path, 0, "trap", 0)
             {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
@@ -706,7 +706,7 @@ fn aegis_fs_read(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "read", &path, 0, "trap")
+                .emit(&cap_name, "read", &path, 0, "trap", 0)
             {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
@@ -723,7 +723,7 @@ fn aegis_fs_read(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "read", &path, file_size, "trap")
+                .emit(&cap_name, "read", &path, file_size, "trap", 0)
             {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
@@ -740,7 +740,7 @@ fn aegis_fs_read(
         if let Err(e) = emitter
             .lock()
             .unwrap()
-            .emit(&cap_name, "read", &path, file_size, "success")
+            .emit(&cap_name, "read", &path, file_size, "success", 0)
         {
             return Err(anyhow::anyhow!("receipt emission failed: {}", e));
         }
@@ -811,7 +811,7 @@ fn aegis_fs_write(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "write", "", 0, "trap")
+                .emit(&cap_name, "write", "", 0, "trap", 0)
             {
                 return anyhow::anyhow!("receipt emission failed: {}", e);
             }
@@ -829,7 +829,7 @@ fn aegis_fs_write(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "write", &path, 0, "trap")
+                .emit(&cap_name, "write", &path, 0, "trap", 0)
             {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
@@ -868,7 +868,7 @@ fn aegis_fs_write(
                             let _ = emitter
                                 .lock()
                                 .unwrap()
-                                .emit(&cap_name, "write", &path, 0, "trap");
+                                .emit(&cap_name, "write", &path, 0, "trap", 0);
                         }
                         bail!("symlink target contains '..' traversal segment");
                     }
@@ -909,7 +909,7 @@ fn aegis_fs_write(
             let _ = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "write", &path, 0, "trap");
+                .emit(&cap_name, "write", &path, 0, "trap", 0);
         }
         bail!("path contains '..' after resolution — traversal attempt");
     }
@@ -919,7 +919,7 @@ fn aegis_fs_write(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "write", &path, 0, "trap")
+                .emit(&cap_name, "write", &path, 0, "trap", 0)
             {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
@@ -939,7 +939,7 @@ fn aegis_fs_write(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "write", &path, 0, "trap")
+                .emit(&cap_name, "write", &path, 0, "trap", 0)
             {
                 return anyhow::anyhow!("receipt emission failed: {}", e);
             }
@@ -954,7 +954,7 @@ fn aegis_fs_write(
             if let Err(e) = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "write", &path, data_size, "trap")
+                .emit(&cap_name, "write", &path, data_size, "trap", 0)
             {
                 return Err(anyhow::anyhow!("receipt emission failed: {}", e));
             }
@@ -1002,7 +1002,7 @@ fn aegis_fs_write(
             let _ = emitter
                 .lock()
                 .unwrap()
-                .emit(&cap_name, "write", &path, data_size, "trap");
+                .emit(&cap_name, "write", &path, data_size, "trap", 0);
         }
         bail!("atomic rename failed: {}", e);
     }
@@ -1016,7 +1016,7 @@ fn aegis_fs_write(
         if let Err(e) = emitter
             .lock()
             .unwrap()
-            .emit(&cap_name, "write", &path, data_size, "success")
+            .emit(&cap_name, "write", &path, data_size, "success", 0)
         {
             // S-416-W-after-rename: emit failed AFTER successful rename
             // File is already written at target — we CANNOT undo it.
@@ -1317,7 +1317,7 @@ fn emit_network_receipt(
         emitter
             .lock()
             .unwrap()
-            .emit("network.http", "fetch", path, size, result)
+            .emit("network.http", "fetch", path, size, result, 0)
             .map_err(|e| anyhow::anyhow!("receipt emission failed: {}", e))?;
     }
     Ok(())
@@ -1718,7 +1718,7 @@ mod tests {
     fn e801_inverse_set_fuel_without_consume_fuel_flag() {
         use wasmtime::{Config, Engine, Store};
 
-        let mut engine_config = Config::new();
+        let engine_config = Config::new();
         // Deliberately NOT setting consume_fuel(true)
         let engine = Engine::new(&engine_config).expect("engine creation");
         let mut store = Store::new(&engine, ());

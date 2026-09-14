@@ -597,6 +597,7 @@ async fn verify_chain_tampered_receipt_via_grpc() -> Result<()> {
         100,
         [0u8; 32],
         &key_pair,
+        0,
     )?;
 
     // Tamper with the receipt (modify capability_name)

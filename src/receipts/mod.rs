@@ -22,6 +22,12 @@ pub struct ExecutionReceipt {
     #[serde(with = "serde_bytes")]
     pub signature: [u8; 64],
     pub timestamp_ns: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fuel_consumed: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl ExecutionReceipt {
@@ -29,6 +35,7 @@ impl ExecutionReceipt {
     ///
     /// `prev_hash` is set externally by the caller (ReceiptEmitter or chain logic).
     /// `timestamp_ns` is set to current system time in nanoseconds.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         capability_name: &str,
         action: &str,
@@ -37,6 +44,7 @@ impl ExecutionReceipt {
         size: u64,
         prev_hash: [u8; 32],
         key_pair: &Ed25519KeyPair,
+        fuel_consumed: u64,
     ) -> Result<Self> {
         let timestamp_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
 
@@ -49,6 +57,7 @@ impl ExecutionReceipt {
             prev_hash,
             signature: [0u8; 64], // placeholder for signing
             timestamp_ns,
+            fuel_consumed,
         };
 
         // Sign canonical bytes (without signature field)
@@ -76,6 +85,7 @@ impl ExecutionReceipt {
             prev_hash: self.prev_hash,
             signature: [0u8; 64],
             timestamp_ns: self.timestamp_ns,
+            fuel_consumed: self.fuel_consumed,
         };
         serde_json::to_vec(&unsigned).expect("receipt serialization should not fail")
     }
@@ -96,6 +106,7 @@ impl ExecutionReceipt {
             prev_hash: self.prev_hash,
             signature: [0u8; 64],
             timestamp_ns: self.timestamp_ns,
+            fuel_consumed: self.fuel_consumed,
         };
         let canonical = serde_json::to_vec(&unsigned)?;
         let verifying_key = signature::UnparsedPublicKey::new(&signature::ED25519, public_key);
@@ -229,6 +240,8 @@ impl ReceiptEmitter {
     /// Emit a signed receipt, updating the chain state.
     ///
     /// Returns `Err` on signing failure — never produces an unsigned receipt (REQ-433).
+    /// `fuel_consumed`: for capability receipts (fs/network), pass 0 (skip-if-zero serialization);
+    /// for Execute receipts, pass the measured `sandbox.fuel_consumed()`.
     pub fn emit(
         &mut self,
         capability: &str,
@@ -236,6 +249,7 @@ impl ReceiptEmitter {
         path: &str,
         size: u64,
         result: &str,
+        fuel_consumed: u64,
     ) -> Result<ExecutionReceipt> {
         // Test-only hook to force signing failure for fail-closed verification.
         // Only compiled with the "test-utils" feature (enabled for dev-dependencies).
@@ -253,6 +267,7 @@ impl ReceiptEmitter {
             size,
             self.last_prev_hash,
             &self.key_pair,
+            fuel_consumed,
         )?;
 
         // Update chain: next receipt's prev_hash = blake3(this receipt's canonical bytes)
@@ -304,6 +319,7 @@ mod tests {
             11,
             [0u8; 32],
             &kp,
+            0,
         )
         .unwrap();
 
@@ -336,6 +352,7 @@ mod tests {
             42,
             [0u8; 32],
             &kp,
+            0,
         )
         .unwrap();
 
@@ -364,6 +381,7 @@ mod tests {
             10,
             [0u8; 32],
             &kp,
+            0,
         )
         .unwrap();
 
@@ -378,6 +396,7 @@ mod tests {
             20,
             prev_hash,
             &kp,
+            0,
         )
         .unwrap();
 
@@ -405,6 +424,7 @@ mod tests {
             10,
             [0u8; 32],
             &kp,
+            0,
         )
         .unwrap();
 
@@ -434,6 +454,7 @@ mod tests {
             10,
             [0u8; 32],
             &kp,
+            0,
         )
         .unwrap();
 
@@ -446,6 +467,7 @@ mod tests {
             20,
             [1u8; 32], // wrong prev_hash — should be hash of r1
             &kp,
+            0,
         )
         .unwrap();
 
@@ -478,6 +500,7 @@ mod tests {
             10,
             [0u8; 32],
             &kp,
+            0,
         )
         .unwrap();
 
@@ -518,6 +541,7 @@ mod tests {
             10,
             [0u8; 32],
             &kp1,
+            0,
         )
         .unwrap();
 
@@ -537,7 +561,7 @@ mod tests {
         let mut emitter = ReceiptEmitter::new(kp);
 
         let receipt = emitter
-            .emit("filesystem.read", "read", "test.txt", 11, "success")
+            .emit("filesystem.read", "read", "test.txt", 11, "success", 0)
             .unwrap();
 
         assert_eq!(receipt.capability_name, "filesystem.read");
@@ -552,10 +576,10 @@ mod tests {
         let mut emitter = ReceiptEmitter::new(kp);
 
         let r1 = emitter
-            .emit("filesystem.read", "read", "a.txt", 10, "success")
+            .emit("filesystem.read", "read", "a.txt", 10, "success", 0)
             .unwrap();
         let r2 = emitter
-            .emit("filesystem.read", "read", "b.txt", 20, "success")
+            .emit("filesystem.read", "read", "b.txt", 20, "success", 0)
             .unwrap();
 
         // r2's prev_hash should NOT be genesis
@@ -582,18 +606,18 @@ mod tests {
         let mut emitter = ReceiptEmitter::new(kp);
 
         // Normal emit should succeed
-        let receipt = emitter.emit("filesystem.read", "read", "test.txt", 11, "success");
+        let receipt = emitter.emit("filesystem.read", "read", "test.txt", 11, "success", 0);
         assert!(receipt.is_ok(), "Normal emit should succeed");
 
         // Force next emit to fail
         emitter.force_signing_failure();
 
         // Next emit should fail
-        let result = emitter.emit("filesystem.read", "read", "test.txt", 11, "success");
+        let result = emitter.emit("filesystem.read", "read", "test.txt", 11, "success", 0);
         assert!(result.is_err(), "Emit should fail when forced");
 
         // Next emit after failure should succeed again (flag reset)
-        let receipt = emitter.emit("filesystem.read", "read", "test.txt", 11, "success");
+        let receipt = emitter.emit("filesystem.read", "read", "test.txt", 11, "success", 0);
         assert!(receipt.is_ok(), "Emit should succeed after forced failure");
     }
 
@@ -607,10 +631,10 @@ mod tests {
 
         // Emit a chain of receipts
         let r1 = emitter
-            .emit("filesystem.read", "read", "a.txt", 10, "success")
+            .emit("filesystem.read", "read", "a.txt", 10, "success", 0)
             .unwrap();
         let r2 = emitter
-            .emit("filesystem.read", "read", "b.txt", 20, "success")
+            .emit("filesystem.read", "read", "b.txt", 20, "success", 0)
             .unwrap();
 
         // Save chain to JSON file

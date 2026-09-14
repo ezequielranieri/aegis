@@ -120,6 +120,10 @@ impl AegisRuntime for AegisRuntimeService {
             .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
             .await;
 
+        // Capture fuel consumed post-call (works for both success and trap paths).
+        // get_fuel() returns remaining fuel; budget_resolved - remaining = consumed.
+        let fuel_consumed = sandbox.fuel_consumed();
+
         tracing::debug!("DEBUG execute: wasm execution result = {:?}", result_bytes);
 
         match result_bytes {
@@ -164,6 +168,7 @@ impl AegisRuntime for AegisRuntimeService {
                             &capability_path,
                             size,
                             &result_hash,
+                            fuel_consumed,
                         )
                         .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?;
                 }
@@ -189,9 +194,9 @@ impl AegisRuntime for AegisRuntimeService {
                 }))
             }
             Err(status) => {
-                // Emit trap receipt on failure
+                // Emit trap receipt on failure (with fuel_consumed captured post-call)
                 if let Ok(mut emitter) = self.receipt_emitter.lock() {
-                    let _ = emitter.emit(&capability_name, "execute", "", 0, "trap");
+                    let _ = emitter.emit(&capability_name, "execute", "", 0, "trap", fuel_consumed);
                 }
 
                 // For capability violations (traversal, size exceed) and signing failures,
@@ -370,6 +375,13 @@ impl AegisRuntimeService {
                 } else {
                     "WASM execution trapped"
                 }
+            // D4 fuel arm (Phase 8): evaluated after network guard, before fs cascade.
+            // Matches deterministic wasmtime literal "all fuel consumed" from trap_encoding.rs:142.
+            } else if std::iter::successors(e.source(), |s| s.source())
+                .map(|s| s.to_string())
+                .any(|f| f.contains("all fuel consumed"))
+            {
+                "fuel budget exceeded"
             } else if msg.contains("traversal")
                 || msg.contains("..")
                 || msg.contains("outside")
