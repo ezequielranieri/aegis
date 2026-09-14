@@ -70,19 +70,19 @@ impl AegisRuntime for AegisRuntimeService {
 
         // 4. Create sandbox for this request
         // Check for test mode to disable epoch interruption entirely (avoids "wasm trap: interrupt" in tests)
+        // Fuel metering stays on in both modes (E-804/E-805); only epoch differs.
         let test_mode = std::env::var("AEGIS_TEST_MODE").is_ok();
-        let mut sandbox = if test_mode {
-            // Disable epoch interruption entirely for tests (like unit tests do)
-            Sandbox::new_with_config(SandboxConfig::default(), false).map_err(|e| {
-                tracing::error!(error = %e, "failed to create sandbox");
-                Status::internal(format!("failed to create sandbox: {}", e))
-            })?
-        } else {
-            Sandbox::new_with_limits(SandboxConfig::default()).map_err(|e| {
-                tracing::error!(error = %e, "failed to create sandbox");
-                Status::internal(format!("failed to create sandbox: {}", e))
-            })?
-        };
+        let mut sandbox = Sandbox::new_with_config(
+            SandboxConfig {
+                fuel_budget: self.fuel_budget,
+                ..SandboxConfig::default()
+            },
+            !test_mode, // enable_epoch = !test_mode (test_mode=true means disable epoch)
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to create sandbox");
+            Status::internal(format!("failed to create sandbox: {}", e))
+        })?;
 
         // 5. Set the shared receipt emitter on the sandbox
         sandbox.store_mut().data_mut().receipt_emitter = Some(self.receipt_emitter.clone());
