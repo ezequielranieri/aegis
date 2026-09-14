@@ -22,6 +22,7 @@ use crate::sandbox::{Sandbox, SandboxConfig};
 pub struct AegisRuntimeService {
     pub receipt_emitter: Arc<Mutex<ReceiptEmitter>>,
     pub semaphore: Arc<Semaphore>,
+    pub fuel_budget: Option<u64>,
 }
 
 #[tonic::async_trait]
