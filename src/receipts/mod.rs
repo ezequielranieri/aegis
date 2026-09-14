@@ -657,4 +657,101 @@ mod tests {
             result.err()
         );
     }
+
+    // === Phase 8: fuel_consumed field verification ===
+
+    /// E-802: golden bytes test — receipt with fuel_consumed=0 serializes byte-identical
+    /// to pre-change schema (skip-if-zero omits the field). Old chains verify unchanged.
+    #[test]
+    fn e802_golden_bytes_fuel_zero_byte_identical() {
+        let kp = test_keypair();
+        let receipt = ExecutionReceipt::new(
+            "execute", "execute", "success", "", 0, [0u8; 32], &kp, 0, // fuel_consumed = 0
+        )
+        .unwrap();
+
+        // Serialize with fuel=0
+        let bytes_with_zero = receipt.canonical_bytes();
+
+        // Build a "pre-change" receipt manually (same fields except fuel_consumed)
+        // and serialize it the same way — should be byte-identical
+        #[derive(Serialize)]
+        struct LegacyReceipt {
+            capability_name: String,
+            action: String,
+            result: String,
+            path: String,
+            size: u64,
+            #[serde(with = "serde_bytes")]
+            prev_hash: [u8; 32],
+            #[serde(with = "serde_bytes")]
+            signature: [u8; 64],
+            timestamp_ns: u64,
+        }
+
+        let legacy = LegacyReceipt {
+            capability_name: receipt.capability_name.clone(),
+            action: receipt.action.clone(),
+            result: receipt.result.clone(),
+            path: receipt.path.clone(),
+            size: receipt.size,
+            prev_hash: receipt.prev_hash,
+            signature: receipt.signature,
+            timestamp_ns: receipt.timestamp_ns,
+        };
+        let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+
+        // Byte-identical: skip-if-zero omits fuel_consumed when 0
+        assert_eq!(
+            bytes_with_zero, legacy_bytes,
+            "E-802: receipt with fuel_consumed=0 must be byte-identical to pre-change schema"
+        );
+
+        // Also verify the field is absent in JSON when 0
+        let json = serde_json::to_string(&receipt).unwrap();
+        assert!(
+            !json.contains("fuel_consumed"),
+            "fuel_consumed field must be omitted from JSON when 0 (skip-if-zero)"
+        );
+    }
+
+    /// S-803: skip-if-zero + field order — field absent at 0, present and last in canonical bytes at >0
+    #[test]
+    fn s803_skip_if_zero_field_order() {
+        let kp = test_keypair();
+
+        // fuel=0 → field absent in canonical JSON (skip-if-zero)
+        let receipt_zero =
+            ExecutionReceipt::new("execute", "execute", "success", "", 0, [0u8; 32], &kp, 0)
+                .unwrap();
+        let json_zero = serde_json::to_string(&receipt_zero).unwrap();
+        assert!(
+            !json_zero.contains("fuel_consumed"),
+            "fuel_consumed must be absent when 0 (skip-if-zero)"
+        );
+
+        // fuel=42 → field present; verify field order in CANONICAL BYTES (struct declaration order)
+        // by checking that fuel_consumed appears AFTER timestamp_ns in the serialized bytes
+        let receipt_nonzero =
+            ExecutionReceipt::new("execute", "execute", "success", "", 0, [0u8; 32], &kp, 42)
+                .unwrap();
+        let canonical = receipt_nonzero.canonical_bytes();
+        let canonical_str = String::from_utf8(canonical).unwrap();
+
+        // In canonical bytes (struct field order), fuel_consumed must appear AFTER timestamp_ns
+        let ts_pos = canonical_str
+            .rfind("timestamp_ns")
+            .expect("timestamp_ns must exist");
+        let fuel_pos = canonical_str
+            .rfind("fuel_consumed")
+            .expect("fuel_consumed must exist");
+        assert!(
+            fuel_pos > ts_pos,
+            "fuel_consumed must appear AFTER timestamp_ns in canonical bytes (struct declaration order)"
+        );
+
+        // Also verify the field value is correct
+        let json = serde_json::to_value(&receipt_nonzero).unwrap();
+        assert_eq!(json["fuel_consumed"], 42);
+    }
 }
