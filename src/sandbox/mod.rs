@@ -38,6 +38,10 @@ pub struct SandboxConfig {
     /// Epoch timer interval (default: 100ms).
     /// Controls how frequently `increment_epoch()` is called on the engine.
     pub epoch_interval: Duration,
+    /// Fuel metering (phase 8): consume_fuel flag, always-on in production (REQ-001).
+    pub consume_fuel: bool,
+    /// Per-execution fuel budget; None → default_fuel_budget().
+    pub fuel_budget: Option<u64>,
 }
 
 impl Default for SandboxConfig {
@@ -48,8 +52,17 @@ impl Default for SandboxConfig {
             instances: 4,
             memories: 2,
             epoch_interval: Duration::from_millis(100),
+            consume_fuel: true,
+            fuel_budget: None,
         }
     }
+}
+
+/// Calibrated by the phase-8 design spike (Section 6): 10,000,000.
+pub const DEFAULT_FUEL_BUDGET: u64 = 10_000_000;
+
+pub fn default_fuel_budget() -> u64 {
+    DEFAULT_FUEL_BUDGET
 }
 
 /// Configuration for a capability grant (filesystem.read, filesystem.write, etc.).
@@ -339,6 +352,9 @@ pub struct Sandbox {
     engine: Engine,
     store: Store<SandboxState>,
     _epoch_interrupter: Option<EpochInterrupter>,
+    /// Resolved fuel budget at construction (config.fuel_budget or default).
+    /// Used by `fuel_consumed()` to compute consumption post-execution.
+    budget_resolved: u64,
 }
 
 impl Sandbox {
@@ -364,11 +380,13 @@ impl Sandbox {
     /// Returns `Err` if the engine or store cannot be created.
     pub fn new_with_config(config: SandboxConfig, enable_epoch: bool) -> Result<Self> {
         let mut engine_config = Config::new();
+        // REQ-001: Always enable fuel metering (consume_fuel) at engine creation.
+        // This is mandatory — stores created without it cannot have fuel set later (T-10).
+        engine_config.consume_fuel(true);
         if enable_epoch {
             engine_config.epoch_interruption(true);
-            // Epoch-only interruption (no fuel metering).
-            // Limitation: tight loops without host calls may not yield for full epoch interval.
-            // See DECISIONS.md AD-002. Phase 1 host functions provide natural epoch check points.
+            // Epoch interruption remains the wall-clock security boundary (AD-002).
+            // Fuel metering is instruction accounting; the two are complementary.
         }
         let engine = Engine::new(&engine_config)?;
 
@@ -394,6 +412,12 @@ impl Sandbox {
         );
         store.limiter(|state| &mut state.limits);
 
+        // REQ-001: Set explicit fuel budget for every execution — never rely on store default 0.
+        let budget_resolved = config.fuel_budget.unwrap_or_else(default_fuel_budget);
+        store
+            .set_fuel(budget_resolved)
+            .map_err(|e| anyhow::anyhow!("set_fuel failed: {}", e))?;
+
         let epoch_interrupter = if enable_epoch {
             Some(EpochInterrupter::new(engine.clone(), config.epoch_interval))
         } else {
@@ -404,6 +428,7 @@ impl Sandbox {
             engine,
             store,
             _epoch_interrupter: epoch_interrupter,
+            budget_resolved,
         })
     }
 
@@ -415,6 +440,14 @@ impl Sandbox {
             .as_ref()
             .map(|e| e.lock().unwrap().chain().to_vec())
             .unwrap_or_default()
+    }
+
+    /// Fuel consumed by the most recent execution of this sandbox:
+    /// resolved_budget - get_fuel(). Returns 0 when fuel is not configured.
+    pub fn fuel_consumed(&self) -> u64 {
+        let resolved = self.budget_resolved;
+        let remaining = self.store.get_fuel().unwrap_or(resolved);
+        resolved.saturating_sub(remaining)
     }
 
     /// Instantiates a WASM module in the sandbox.
@@ -1632,5 +1665,132 @@ mod tests {
 
         // Trap-path semantics: OOB → path "" (fs precedent).
         assert_network_trap_receipt(&sandbox.get_receipt_chain(), "", 0, &pub_key);
+    }
+
+    // ═══ Phase 8: Fuel Metering Unit Tests (WU1) ═══
+
+    /// E-801: no `set_fuel` → instant trap (store default 0).
+    /// This test creates a sandbox with `consume_fuel=true` but omits `set_fuel`
+    /// to verify the default-0 instant-trap behavior.
+    #[test]
+    fn e801_no_set_fuel_instant_trap() {
+        use wasmtime::{Config, Engine, Store};
+
+        let mut engine_config = Config::new();
+        engine_config.consume_fuel(true);
+        let engine = Engine::new(&engine_config).expect("engine creation");
+        let mut store = Store::new(&engine, ());
+        // NOTE: deliberately NOT calling store.set_fuel() — tests default 0 behavior.
+
+        // A simple module that does nothing should still trap instantly
+        // because the store starts with 0 fuel.
+        let wat = r#"
+            (module
+              (func (export "_start")
+                (nop)
+              )
+            )
+        "#;
+        let module = wasmtime::Module::new(&engine, wat).expect("module compile");
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instantiate");
+        let func = instance
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .expect("function found");
+
+        let result = func.call(&mut store, ());
+        assert!(
+            result.is_err(),
+            "Expected trap due to 0 fuel, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            error_chain_contains(&err, "all fuel consumed"),
+            "Expected 'all fuel consumed' in error chain, got: {:?}",
+            err
+        );
+    }
+
+    /// E-801-inverso: `set_fuel` without engine `consume_fuel` flag → error.
+    /// Verifies that calling `set_fuel` on a store whose engine lacks `consume_fuel`
+    /// returns the wasmtime error "fuel is not configured in this store".
+    #[test]
+    fn e801_inverse_set_fuel_without_consume_fuel_flag() {
+        use wasmtime::{Config, Engine, Store};
+
+        let mut engine_config = Config::new();
+        // Deliberately NOT setting consume_fuel(true)
+        let engine = Engine::new(&engine_config).expect("engine creation");
+        let mut store = Store::new(&engine, ());
+
+        let result = store.set_fuel(10_000_000);
+        assert!(
+            result.is_err(),
+            "Expected error when setting fuel without consume_fuel flag"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("fuel is not configured in this store"),
+            "Expected 'fuel is not configured in this store' error, got: {}",
+            err
+        );
+    }
+
+    /// Host I/O basic test with fuel enabled — verify normal execution works
+    /// and fuel_consumed() returns a reasonable value.
+    #[test]
+    fn fuel_basic_hostio_works() {
+        use crate::capabilities::{Capability, FilesystemReadParams};
+        use crate::sandbox::SandboxConfig;
+        use wat::parse_str;
+
+        // Simple WAT module that does a filesystem read
+        const TEST_READ: &str = r#"
+            (module
+              (import "aegis" "fs_read" (func $fs_read (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 1024) "test.txt\00")
+              (func (export "_start")
+                (call $fs_read (i32.const 1024) (i32.const 8) (i32.const 2048) (i32.const 1024))
+                drop
+              )
+            )
+        "#;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.txt"), "hello world").unwrap();
+        let cap = Capability::FilesystemRead(FilesystemReadParams {
+            allowed_root: std::path::PathBuf::from(tmp.path()),
+            max_read_bytes: 1_048_576,
+        });
+
+        let mut sandbox = Sandbox::new_with_config(SandboxConfig::default(), false)
+            .expect("Failed to create sandbox");
+
+        let wasm = parse_str(TEST_READ).expect("WAT parse failed");
+        let instance = sandbox
+            .instantiate_with_capabilities(&wasm, &[cap])
+            .expect("Module should instantiate");
+
+        let func = instance
+            .get_typed_func::<(), ()>(sandbox.store_mut(), "_start")
+            .expect("Function not found");
+
+        let result = func.call(sandbox.store_mut(), ());
+        assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
+
+        // fuel_consumed() should return a small positive value (> 0)
+        let fuel = sandbox.fuel_consumed();
+        assert!(
+            fuel > 0,
+            "fuel_consumed() should be > 0 for a real execution, got: {}",
+            fuel
+        );
+        // Should be well under the default budget
+        assert!(
+            fuel < crate::sandbox::DEFAULT_FUEL_BUDGET,
+            "fuel should be far under budget"
+        );
     }
 }
