@@ -25,5 +25,9 @@ verify-report.md
 # Spike/experimentation
 spike/
 
-# SDD artifacts
+# SDD artifacts (process tooling; keep openspec/specs/ public)
 sdd/
+openspec/changes/
+openspec/config.yaml
+openspec/project-context.md
+openspec/testing-capabilities.md
