@@ -60,6 +60,7 @@ pub async fn start_server_internal(
     tracing::info!("receipt key loaded successfully");
 
     let receipt_emitter = Arc::new(Mutex::new(ReceiptEmitter::new(key_pair)));
+    ReceiptEmitter::spawn_ttl_sweep(receipt_emitter.clone());
 
     start_server_with_emitter(config, addr, shutdown, receipt_emitter).await
 }

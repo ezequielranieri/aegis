@@ -10,13 +10,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
+use crate::config::PolicyConfig;
 use crate::proto::aegis::v1::aegis_runtime_server::AegisRuntime;
 use crate::proto::aegis::v1::{
-    ExecuteRequest, ExecuteResponse, GetReceiptChainRequest, GetReceiptChainResponse,
-    VerifyChainRequest, VerifyChainResponse,
+    ExecuteAbortRequest, ExecuteAbortResponse, ExecuteCommitRequest, ExecuteCommitResponse,
+    ExecutePrepareRequest, ExecutePrepareResponse, ExecuteRequest, ExecuteResponse,
+    GetReceiptChainRequest, GetReceiptChainResponse, VerifyChainRequest, VerifyChainResponse,
 };
-use crate::receipts::{ExecutionReceipt, ReceiptChain, ReceiptEmitter};
-use crate::sandbox::{Sandbox, SandboxConfig};
+use crate::receipts::{ExecutionReceipt, PrepareHandle, ReceiptChain, ReceiptEmitter};
+use crate::sandbox::Sandbox;
 
 /// Shared state for all AegisRuntime RPC handlers.
 pub struct AegisRuntimeService {
@@ -31,8 +33,11 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ExecuteRequest>,
     ) -> Result<Response<ExecuteResponse>, Status> {
+        // Legacy Execute RPC: internally uses Prepare+Commit two-phase flow.
+        // On Commit signing failure -> Abort with error="commit_signing_failed" (AD-016).
+        // Does NOT require TwoPhaseReceipts capability (legacy compatibility).
+
         // Acquire semaphore permit for concurrency limiting (REQ-810)
-        // Use try_acquire to immediately reject when at capacity (RESOURCE_EXHAUSTED)
         let _permit = self
             .semaphore
             .clone()
@@ -44,7 +49,7 @@ impl AegisRuntime for AegisRuntimeService {
         let config_bytes = req.config;
         let wasm_module_bytes = req.wasm_module;
 
-        tracing::info!(capability = %capability_name, "execute request received");
+        tracing::info!(capability = %capability_name, "execute (legacy wrapper) request received");
 
         // 1. Parse TOML config from request bytes
         let config_str = String::from_utf8(config_bytes).map_err(|e| {
@@ -53,13 +58,13 @@ impl AegisRuntime for AegisRuntimeService {
         })?;
 
         // 2. Parse the TOML config to extract capabilities
-        let policy_config: crate::config::PolicyConfig =
-            toml::from_str(&config_str).map_err(|e| {
-                tracing::warn!(error = %e, "invalid TOML config");
-                Status::invalid_argument(format!("invalid TOML config: {}", e))
-            })?;
+        let policy_config: PolicyConfig = toml::from_str(&config_str).map_err(|e| {
+            tracing::warn!(error = %e, "invalid TOML config");
+            Status::invalid_argument(format!("invalid TOML config: {}", e))
+        })?;
 
         let capabilities = policy_config
+            .clone()
             .try_into_capabilities()
             .map_err(|e| Status::invalid_argument(format!("invalid capabilities: {}", e)))?;
 
@@ -68,44 +73,9 @@ impl AegisRuntime for AegisRuntimeService {
             return Err(Status::invalid_argument("wasm_module is required"));
         }
 
-        // 4. Create sandbox for this request
-        // Check for test mode to disable epoch interruption entirely (avoids "wasm trap: interrupt" in tests)
-        // Fuel metering stays on in both modes (E-804/E-805); only epoch differs.
-        let test_mode = std::env::var("AEGIS_TEST_MODE").is_ok();
-        let mut sandbox = Sandbox::new_with_config(
-            SandboxConfig {
-                fuel_budget: self.fuel_budget,
-                ..SandboxConfig::default()
-            },
-            !test_mode, // enable_epoch = !test_mode (test_mode=true means disable epoch)
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "failed to create sandbox");
-            Status::internal(format!("failed to create sandbox: {}", e))
-        })?;
-
-        // 5. Set the shared receipt emitter on the sandbox
-        sandbox.store_mut().data_mut().receipt_emitter = Some(self.receipt_emitter.clone());
-
-        // 5b. Test-only transport override injection (REQ-610 E2E). The
-        //     `test-utils` feature is enabled exclusively through the
-        //     dev-dependency `aegis = { path = ".", features = ["test-utils"] }`,
-        //     so this block never compiles into production binaries. Fail-closed:
-        //     the override applies ONLY when test mode is active — a stray
-        //     `AEGIS_TEST_NETWORK_PORT` in a production environment is ignored.
-        #[cfg(feature = "test-utils")]
-        if test_mode {
-            if let Ok(port_str) = std::env::var("AEGIS_TEST_NETWORK_PORT") {
-                let state = sandbox.store_mut().data_mut();
-                state.network_test_port = port_str.parse::<u16>().ok();
-                if let Ok(ca_path) = std::env::var("AEGIS_TEST_CA_PEM") {
-                    state.network_test_ca_pem = std::fs::read(&ca_path).ok();
-                }
-            }
-        }
-
-        // 6. Find the matching capability by name
-        let matching_cap = capabilities
+        // 4. Find the matching capability by name (the actual capability to execute)
+        // Legacy Execute: does NOT require TwoPhaseReceipts capability
+        let _matching_cap = capabilities
             .iter()
             .find(|c| c.capability_name() == capability_name)
             .ok_or_else(|| {
@@ -115,96 +85,236 @@ impl AegisRuntime for AegisRuntimeService {
                 ))
             })?;
 
-        // 7. Execute the capability in the sandbox via WASM
+        // 5. Check if this is a TwoPhaseReceipts capability (should not be executable via legacy)
+        if capability_name == "two_phase_receipts" {
+            return Err(Status::failed_precondition(
+                "two_phase_receipts is not an executable capability; use ExecutePrepare",
+            ));
+        }
+
+        // 6. Phase 1: Prepare - create sandbox and sign prepare receipt
+        let (_prepare_receipt, prepare_handle) = {
+            let mut emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .prepare(
+                    &capability_name,
+                    policy_config.clone(),
+                    &wasm_module_bytes,
+                    self.fuel_budget,
+                )
+                .map_err(|e| Status::internal(format!("prepare failed: {}", e)))?
+        };
+
+        // 7. Get the sandbox handle from the pending entry
+        let sandbox_handle = {
+            let emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .get_pending_sandbox(&prepare_handle)
+                .ok_or_else(|| Status::internal("sandbox handle not found after prepare"))?
+        };
+
+        // 8. Get the config for receipt emission
+        let config = {
+            let emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .get_pending_config(&prepare_handle)
+                .ok_or_else(|| Status::internal("config not found after prepare"))?
+        };
+
+        // 9. Get the WASM module
+        let wasm_module = {
+            let emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .get_pending_wasm_module(&prepare_handle)
+                .ok_or_else(|| Status::internal("wasm module not found after prepare"))?
+        };
+
+        // 10. Execute WASM in the prepared sandbox
+        let mut sandbox = sandbox_handle.lock().await;
+        sandbox.store_mut().data_mut().receipt_emitter = Some(self.receipt_emitter.clone());
+
+        // Test-only transport override injection
+        #[cfg(feature = "test-utils")]
+        if std::env::var("AEGIS_TEST_MODE").is_ok() {
+            if let Ok(port_str) = std::env::var("AEGIS_TEST_NETWORK_PORT") {
+                let state = sandbox.store_mut().data_mut();
+                state.network_test_port = port_str.parse::<u16>().ok();
+                if let Ok(ca_path) = std::env::var("AEGIS_TEST_CA_PEM") {
+                    state.network_test_ca_pem = std::fs::read(&ca_path).ok();
+                }
+            }
+        }
+
+        // Execute the capability
         let result_bytes = self
-            .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
+            .execute_wasm_capability(
+                &mut sandbox,
+                &config
+                    .clone()
+                    .try_into_capabilities()
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                &wasm_module,
+            )
             .await;
 
-        // Capture fuel consumed post-call (works for both success and trap paths).
-        // get_fuel() returns remaining fuel; budget_resolved - remaining = consumed.
+        // Capture fuel consumed
         let fuel_consumed = sandbox.fuel_consumed();
 
-        tracing::debug!("DEBUG execute: wasm execution result = {:?}", result_bytes);
-
+        // 11. Handle result: success -> commit with hash, failure -> abort with trap
         match result_bytes {
             Ok(result_bytes) => {
-                // Calculate BLAKE3 hash for receipt
+                // Success: compute hash and commit
                 let result_hash = blake3::hash(&result_bytes).to_hex().to_string();
+                let cap = config
+                    .try_into_capabilities()
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .into_iter()
+                    .find(|c| c.capability_name() == capability_name)
+                    .ok_or_else(|| Status::internal("capability not found in config"))?;
 
-                // Extract path from capability config for receipt (REQ-610, D5).
-                // For network.http the host-recorded `FetchRecord` is authoritative:
-                // path = the URL actually fetched, result = BLAKE3(body) hex,
-                // size = response byte length. When no fetch was performed
-                // (`None` — module never fetched, or trapped mid-flight), fall
-                // back to the generic values; REQ-610 constrains performed fetches.
-                let (capability_path, result_hash, size) = match &matching_cap {
+                let (capability_path, size) = match cap {
                     crate::capabilities::Capability::FilesystemRead(params) => (
                         params.allowed_root.to_string_lossy().to_string(),
-                        result_hash,
                         result_bytes.len() as u64,
                     ),
                     crate::capabilities::Capability::FilesystemWrite(params) => (
                         params.allowed_root.to_string_lossy().to_string(),
-                        result_hash,
                         result_bytes.len() as u64,
                     ),
                     crate::capabilities::Capability::NetworkHttp(_) => {
                         match sandbox.store_mut().data_mut().network_fetch.take() {
-                            Some(fetch) => (fetch.url, fetch.body_blake3, fetch.body_len),
-                            None => (String::new(), result_hash, result_bytes.len() as u64),
+                            Some(fetch) => (fetch.url, fetch.body_len),
+                            None => (String::new(), result_bytes.len() as u64),
                         }
+                    }
+                    crate::capabilities::Capability::TwoPhaseReceipts => {
+                        return Err(Status::internal(
+                            "two_phase_receipts should not be executable",
+                        ));
                     }
                 };
 
-                // 8. Emit a success receipt for this execution
-                {
+                // 12. Phase 2: Commit - sign commit receipt with BLAKE3 hash
+                // Pass the BLAKE3 hash (result_hash) as the result for backward compatibility
+                // with legacy execute receipt format (result field = BLAKE3 hash hex)
+                let commit_result = {
+                    let mut emitter = self.receipt_emitter.lock().map_err(|e| {
+                        Status::internal(format!("receipt emitter lock failed: {}", e))
+                    })?;
+                    emitter.commit(
+                        prepare_handle,
+                        result_hash.as_bytes(), // BLAKE3 hash hex string as bytes
+                        &capability_path,
+                        size,
+                        fuel_consumed,
+                    )
+                };
+
+                match commit_result {
+                    Ok(commit_receipt) => {
+                        // Success: return commit receipt
+                        let receipt_bytes = serde_json::to_vec(&commit_receipt)
+                            .expect("commit receipt serialization should not fail");
+
+                        Ok(Response::new(ExecuteResponse {
+                            success: true,
+                            result: result_bytes,
+                            receipt: receipt_bytes,
+                            error_message: String::new(),
+                        }))
+                    }
+                    Err(e)
+                        if e.to_string().contains("signing")
+                            || e.to_string().contains("receipt") =>
+                    {
+                        // Commit signing failure (AD-016): emit abort with error="commit_signing_failed"
+                        tracing::warn!(error = %e, "commit signing failed, emitting abort with commit_signing_failed");
+
+                        let abort_receipt = {
+                            let mut emitter = self.receipt_emitter.lock().map_err(|e| {
+                                Status::internal(format!("receipt emitter lock failed: {}", e))
+                            })?;
+                            emitter
+                                .abort(prepare_handle, Some("commit_signing_failed"))
+                                .map_err(|e| Status::internal(format!("abort failed: {}", e)))?
+                        };
+
+                        let abort_receipt_bytes = serde_json::to_vec(&abort_receipt)
+                            .expect("abort receipt serialization should not fail");
+
+                        // Return success=false with the abort receipt (signing failure is a capability violation class)
+                        Ok(Response::new(ExecuteResponse {
+                            success: false,
+                            result: Vec::new(),
+                            receipt: abort_receipt_bytes,
+                            error_message: "commit signing failed".to_string(),
+                        }))
+                    }
+                    Err(e) => {
+                        // Other commit errors (e.g., prepare not found)
+                        let abort_receipt = {
+                            let mut emitter = self.receipt_emitter.lock().map_err(|e| {
+                                Status::internal(format!("receipt emitter lock failed: {}", e))
+                            })?;
+                            emitter
+                                .abort(prepare_handle, Some("commit_failed"))
+                                .map_err(|e| Status::internal(format!("abort failed: {}", e)))?
+                        };
+
+                        let abort_receipt_bytes = serde_json::to_vec(&abort_receipt)
+                            .expect("abort receipt serialization should not fail");
+
+                        Ok(Response::new(ExecuteResponse {
+                            success: false,
+                            result: Vec::new(),
+                            receipt: abort_receipt_bytes,
+                            error_message: e.to_string(),
+                        }))
+                    }
+                }
+            }
+            Err(status) => {
+                // WASM execution trapped: create legacy trap receipt for backward compatibility
+                // and also abort the two-phase flow for chain integrity.
+                tracing::warn!(error = %status, "WASM execution trapped, emitting legacy trap receipt");
+
+                // Capture fuel consumed before aborting
+                let fuel_consumed = sandbox.fuel_consumed();
+
+                // 1. Abort the two-phase flow for chain integrity (internal)
+                let _ = {
+                    let mut emitter = self.receipt_emitter.lock().map_err(|e| {
+                        Status::internal(format!("receipt emitter lock failed: {}", e))
+                    })?;
+                    emitter.abort(prepare_handle, Some("trap"))
+                };
+
+                // 2. Create legacy trap receipt for client response (backward compatibility)
+                // Format: phase="", result="trap", with correct fuel_consumed
+                // Uses emit_legacy which does NOT add to chain or update chain hash
+                let trap_receipt = {
                     let mut emitter = self.receipt_emitter.lock().map_err(|e| {
                         Status::internal(format!("receipt emitter lock failed: {}", e))
                     })?;
                     emitter
-                        .emit(
-                            &capability_name,
-                            "execute",
-                            &capability_path,
-                            size,
-                            &result_hash,
-                            fuel_consumed,
-                        )
-                        .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?;
-                }
-
-                // 9. Get the receipt from the emitter chain
-                let receipt_json = {
-                    let emitter = self.receipt_emitter.lock().map_err(|e| {
-                        Status::internal(format!("receipt emitter lock failed: {}", e))
-                    })?;
-                    let chain = emitter.chain();
-                    chain.last().map(|r| {
-                        serde_json::to_vec(r).expect("receipt serialization should not fail")
-                    })
+                        .emit_legacy(&capability_name, "execute", "", 0, "trap", fuel_consumed)
+                        .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?
                 };
 
-                let receipt_bytes = receipt_json.unwrap_or_default();
-
-                Ok(Response::new(ExecuteResponse {
-                    success: true,
-                    result: result_bytes,
-                    receipt: receipt_bytes,
-                    error_message: String::new(),
-                }))
-            }
-            Err(status) => {
-                // Emit trap receipt on failure (with fuel_consumed captured post-call)
-                let trap_receipt = if let Ok(mut emitter) = self.receipt_emitter.lock() {
-                    emitter
-                        .emit(&capability_name, "execute", "", 0, "trap", fuel_consumed)
-                        .ok()
-                } else {
-                    None
-                };
-                let trap_receipt_bytes = trap_receipt
-                    .map(|r| serde_json::to_vec(&r).expect("receipt serialization should not fail"))
-                    .unwrap_or_default();
+                let trap_receipt_bytes = serde_json::to_vec(&trap_receipt)
+                    .expect("trap receipt serialization should not fail");
 
                 // For capability violations (traversal, size exceed) and signing failures,
                 // return success=false instead of gRPC error status, per REQ-715 / S-701, S-702
@@ -295,6 +405,310 @@ impl AegisRuntime for AegisRuntimeService {
         tracing::info!(count = receipts.len(), "returning receipt chain");
 
         Ok(Response::new(GetReceiptChainResponse { receipts }))
+    }
+
+    async fn execute_prepare(
+        &self,
+        request: Request<ExecutePrepareRequest>,
+    ) -> Result<Response<ExecutePrepareResponse>, Status> {
+        // Acquire semaphore permit for concurrency limiting (REQ-810)
+        let _permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("max concurrent executions exceeded"))?;
+
+        let req = request.into_inner();
+        let capability_name = req.capability_name;
+        let config_bytes = req.config;
+        let wasm_module_bytes = req.wasm_module;
+
+        tracing::info!(capability = %capability_name, "execute_prepare request received");
+
+        // 1. Parse TOML config from request bytes
+        let config_str = String::from_utf8(config_bytes).map_err(|e| {
+            tracing::warn!(error = %e, "invalid UTF-8 in config");
+            Status::invalid_argument(format!("invalid config encoding: {}", e))
+        })?;
+
+        // 2. Parse the TOML config to extract capabilities
+        let policy_config: PolicyConfig = toml::from_str(&config_str).map_err(|e| {
+            tracing::warn!(error = %e, "invalid TOML config");
+            Status::invalid_argument(format!("invalid TOML config: {}", e))
+        })?;
+
+        // Clone policy_config before moving it into try_into_capabilities
+        let policy_config_for_prepare = policy_config.clone();
+        let capabilities = policy_config
+            .try_into_capabilities()
+            .map_err(|e| Status::invalid_argument(format!("invalid capabilities: {}", e)))?;
+
+        // 3. Validate WASM module provided
+        if wasm_module_bytes.is_empty() {
+            return Err(Status::invalid_argument("wasm_module is required"));
+        }
+
+        // 4. Check TwoPhaseReceipts capability is granted (REQ-821)
+        let has_two_phase = capabilities
+            .iter()
+            .any(|c| c.capability_name() == "two_phase_receipts");
+        if !has_two_phase {
+            return Ok(Response::new(ExecutePrepareResponse {
+                success: false,
+                receipt: Vec::new(),
+                prepare_hash: String::new(),
+                error_message: "two_phase_receipts capability not granted".to_string(),
+            }));
+        }
+
+        // 5. Find the matching capability by name (the actual capability to execute)
+        let _matching_cap = capabilities
+            .iter()
+            .find(|c| c.capability_name() == capability_name)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "capability '{}' not granted in config",
+                    capability_name
+                ))
+            })?;
+
+        // 6. Call ReceiptEmitter::prepare() to create sandbox and sign prepare receipt
+        let (prepare_receipt, prepare_handle) = {
+            let mut emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .prepare(
+                    &capability_name,
+                    policy_config_for_prepare, // use the cloned config
+                    &wasm_module_bytes,
+                    self.fuel_budget,
+                )
+                .map_err(|e| Status::internal(format!("prepare failed: {}", e)))?
+        };
+
+        // 7. Store the sandbox handle in the emitter for later commit/abort
+        // The pending map in ReceiptEmitter already holds the SandboxHandle
+        // No additional storage needed here
+
+        // 8. Return the prepare receipt and prepare_hash
+        let prepare_hash = hex::encode(prepare_handle.pending_hash());
+        let receipt_bytes = serde_json::to_vec(&prepare_receipt)
+            .expect("prepare receipt serialization should not fail");
+
+        Ok(Response::new(ExecutePrepareResponse {
+            success: true,
+            receipt: receipt_bytes,
+            prepare_hash,
+            error_message: String::new(),
+        }))
+    }
+
+    async fn execute_commit(
+        &self,
+        request: Request<ExecuteCommitRequest>,
+    ) -> Result<Response<ExecuteCommitResponse>, Status> {
+        // Acquire semaphore permit for concurrency limiting
+        let _permit = self
+            .semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("max concurrent executions exceeded"))?;
+
+        let req = request.into_inner();
+        let prepare_hash_hex = req.prepare_hash;
+        let _result_bytes = req.result; // not used directly, passed to commit
+
+        tracing::info!(prepare_hash = %prepare_hash_hex, "execute_commit request received");
+
+        // Parse prepare_hash from hex
+        let prepare_hash_bytes = hex::decode(&prepare_hash_hex).map_err(|e| {
+            tracing::warn!(error = %e, "invalid prepare_hash hex");
+            Status::invalid_argument(format!("invalid prepare_hash: {}", e))
+        })?;
+        let mut prepare_hash = [0u8; 32];
+        if prepare_hash_bytes.len() != 32 {
+            return Err(Status::invalid_argument("prepare_hash must be 32 bytes"));
+        }
+        prepare_hash.copy_from_slice(&prepare_hash_bytes);
+
+        let handle = PrepareHandle::new(prepare_hash);
+
+        // 1. Get the sandbox handle from the pending entry
+        let sandbox_handle = {
+            let emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter.get_pending_sandbox(&handle).ok_or_else(|| {
+                Status::not_found("prepare_hash not found or already committed/aborted")
+            })?
+        };
+
+        // 2. Get the capability name and config for receipt emission
+        let (capability_name, config) = {
+            let emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            let cap_name = emitter
+                .get_pending_capability_name(&handle)
+                .ok_or_else(|| Status::not_found("prepare_hash not found"))?;
+            let cfg = emitter
+                .get_pending_config(&handle)
+                .ok_or_else(|| Status::not_found("prepare_hash not found"))?;
+            (cap_name, cfg)
+        };
+
+        // 3. Get the WASM module from the pending entry
+        let wasm_module = {
+            let emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .get_pending_wasm_module(&handle)
+                .ok_or_else(|| Status::not_found("prepare_hash not found"))?
+        };
+
+        // 4. Execute WASM in the prepared sandbox
+        let mut sandbox = sandbox_handle.lock().await;
+        sandbox.store_mut().data_mut().receipt_emitter = Some(self.receipt_emitter.clone());
+
+        // Test-only transport override injection
+        #[cfg(feature = "test-utils")]
+        if std::env::var("AEGIS_TEST_MODE").is_ok() {
+            if let Ok(port_str) = std::env::var("AEGIS_TEST_NETWORK_PORT") {
+                let state = sandbox.store_mut().data_mut();
+                state.network_test_port = port_str.parse::<u16>().ok();
+                if let Ok(ca_path) = std::env::var("AEGIS_TEST_CA_PEM") {
+                    state.network_test_ca_pem = std::fs::read(&ca_path).ok();
+                }
+            }
+        }
+
+        // Execute the capability
+        let result_bytes = self
+            .execute_wasm_capability(
+                &mut sandbox,
+                &config
+                    .clone()
+                    .try_into_capabilities()
+                    .map_err(|e| Status::internal(e.to_string()))?,
+                &wasm_module,
+            )
+            .await;
+
+        // Capture fuel consumed
+        let fuel_consumed = sandbox.fuel_consumed();
+
+        // 5. Determine path/result_hash/size for receipt based on capability
+        let (capability_path, _result_hash, size) = match &result_bytes {
+            Ok(result_bytes) => {
+                let result_hash = blake3::hash(result_bytes).to_hex().to_string();
+                let cap = config
+                    .try_into_capabilities()
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .into_iter()
+                    .find(|c| c.capability_name() == capability_name)
+                    .ok_or_else(|| Status::internal("capability not found in config"))?;
+
+                match cap {
+                    crate::capabilities::Capability::FilesystemRead(params) => (
+                        params.allowed_root.to_string_lossy().to_string(),
+                        result_hash,
+                        result_bytes.len() as u64,
+                    ),
+                    crate::capabilities::Capability::FilesystemWrite(params) => (
+                        params.allowed_root.to_string_lossy().to_string(),
+                        result_hash,
+                        result_bytes.len() as u64,
+                    ),
+                    crate::capabilities::Capability::NetworkHttp(_) => {
+                        match sandbox.store_mut().data_mut().network_fetch.take() {
+                            Some(fetch) => (fetch.url, fetch.body_blake3, fetch.body_len),
+                            None => (String::new(), result_hash, result_bytes.len() as u64),
+                        }
+                    }
+                    crate::capabilities::Capability::TwoPhaseReceipts => {
+                        return Err(Status::internal(
+                            "two_phase_receipts should not be executable",
+                        ));
+                    }
+                }
+            }
+            Err(_) => (String::new(), String::new(), 0),
+        };
+
+        // 6. Call ReceiptEmitter::commit() with the results (pure emitter)
+        let commit_receipt = {
+            let mut emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .commit(
+                    handle,
+                    &result_bytes.unwrap_or_default(),
+                    &capability_path,
+                    size,
+                    fuel_consumed,
+                )
+                .map_err(|e| Status::internal(format!("commit failed: {}", e)))?
+        };
+
+        let receipt_bytes = serde_json::to_vec(&commit_receipt)
+            .expect("commit receipt serialization should not fail");
+
+        Ok(Response::new(ExecuteCommitResponse {
+            success: true,
+            receipt: receipt_bytes,
+            error_message: String::new(),
+        }))
+    }
+
+    async fn execute_abort(
+        &self,
+        request: Request<ExecuteAbortRequest>,
+    ) -> Result<Response<ExecuteAbortResponse>, Status> {
+        let req = request.into_inner();
+        let prepare_hash_hex = req.prepare_hash;
+
+        tracing::info!(prepare_hash = %prepare_hash_hex, "execute_abort request received");
+
+        // Parse prepare_hash from hex
+        let prepare_hash_bytes = hex::decode(&prepare_hash_hex).map_err(|e| {
+            tracing::warn!(error = %e, "invalid prepare_hash hex");
+            Status::invalid_argument(format!("invalid prepare_hash: {}", e))
+        })?;
+        let mut prepare_hash = [0u8; 32];
+        if prepare_hash_bytes.len() != 32 {
+            return Err(Status::invalid_argument("prepare_hash must be 32 bytes"));
+        }
+        prepare_hash.copy_from_slice(&prepare_hash_bytes);
+
+        let handle = PrepareHandle::new(prepare_hash);
+
+        // Call ReceiptEmitter::abort()
+        let abort_receipt = {
+            let mut emitter = self
+                .receipt_emitter
+                .lock()
+                .map_err(|e| Status::internal(format!("receipt emitter lock failed: {}", e)))?;
+            emitter
+                .abort(handle, None)
+                .map_err(|e| Status::internal(format!("abort failed: {}", e)))?
+        };
+
+        let receipt_bytes = serde_json::to_vec(&abort_receipt)
+            .expect("abort receipt serialization should not fail");
+
+        Ok(Response::new(ExecuteAbortResponse {
+            success: true,
+            receipt: receipt_bytes,
+            error_message: String::new(),
+        }))
     }
 }
 

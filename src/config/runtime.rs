@@ -4,9 +4,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RuntimeConfig {
     pub server: ServerConfig,
-    pub receipts: ReceiptsConfig,
+    pub receipts: crate::config::ReceiptsConfig,
     pub execution: ExecutionConfig,
 }
+
+pub use crate::config::ReceiptsConfig;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ServerConfig {
@@ -23,12 +25,6 @@ pub struct TlsConfig {
     pub ca_cert_path: PathBuf,
     /// Expected CN/SAN of client cert (e.g., "agent-gateway").
     pub expected_identity: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ReceiptsConfig {
-    /// Ed25519 key file path (0600 perms enforced).
-    pub key_path: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

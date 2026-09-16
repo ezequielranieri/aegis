@@ -1107,25 +1107,44 @@ async fn network_execute_traps_via_grpc() -> Result<()> {
     assert_eq!(resp2.get_ref().error_message, "network connection failed");
 
     // Both executes emitted their receipts into the shared chain:
-    // [fetch trap S-601, execute trap, fetch trap S-603, execute trap].
+    // With two-phase: [prepare1, fetch trap S-601, abort1, prepare2, fetch trap S-603, abort2] = 6 receipts.
     let chain = {
         let emitter = _emitter.lock().expect("emitter lock");
         emitter.chain().to_vec()
     };
-    assert_eq!(chain.len(), 4, "two fetch + two execute trap receipts");
-    assert_eq!(chain[0].capability_name, "network.http");
-    assert_eq!(chain[0].action, "fetch");
-    assert_eq!(chain[0].path, "https://evil.com/x");
-    assert_eq!(chain[0].size, 0);
-    assert_eq!(chain[0].result, "trap");
-    assert_eq!(chain[1].action, "execute");
-    assert_eq!(chain[1].path, "");
+    assert_eq!(
+        chain.len(),
+        6,
+        "two prepare + two abort + two fetch traps = 6 receipts"
+    );
+    // Receipt 0: prepare for execute 1
+    assert_eq!(chain[0].action, "execute");
+    assert_eq!(chain[0].phase, "prepare");
+    assert_eq!(chain[0].result, "pending");
+    // Receipt 1: fetch trap S-601
+    assert_eq!(chain[1].capability_name, "network.http");
+    assert_eq!(chain[1].action, "fetch");
+    assert_eq!(chain[1].path, "https://evil.com/x");
+    assert_eq!(chain[1].size, 0);
     assert_eq!(chain[1].result, "trap");
-    assert_eq!(chain[2].action, "fetch");
-    assert_eq!(chain[2].path, "https://localhost/x");
+    // Receipt 2: abort for execute 1
+    assert_eq!(chain[2].action, "execute");
+    assert_eq!(chain[2].phase, "abort");
+    assert_eq!(chain[2].result, "aborted");
+    // Receipt 3: prepare for execute 2
     assert_eq!(chain[3].action, "execute");
-    assert_eq!(chain[3].path, "");
-    assert_eq!(chain[3].result, "trap");
+    assert_eq!(chain[3].phase, "prepare");
+    assert_eq!(chain[3].result, "pending");
+    // Receipt 4: fetch trap S-603
+    assert_eq!(chain[4].capability_name, "network.http");
+    assert_eq!(chain[4].action, "fetch");
+    assert_eq!(chain[4].path, "https://localhost/x");
+    assert_eq!(chain[4].size, 0);
+    assert_eq!(chain[4].result, "trap");
+    // Receipt 5: abort for execute 2
+    assert_eq!(chain[5].action, "execute");
+    assert_eq!(chain[5].phase, "abort");
+    assert_eq!(chain[5].result, "aborted");
 
     let key_pair = load_receipt_keypair(&certs.signing_key_path())?;
     let public_key = key_pair.public_key().as_ref().to_vec();
@@ -1181,34 +1200,47 @@ async fn network_execute_req610_success_via_grpc() -> Result<()> {
         "execute result bytes must be the fetched body"
     );
 
-    // REQ-610 triple on the LAST (execute) receipt: path = actually-fetched
+    // REQ-610 triple on the LAST (execute commit) receipt: path = actually-fetched
     // URL, result = BLAKE3(body) hex, size = body bytes.
     let expected_hash = blake3::hash(&body).to_hex().to_string();
     let chain = { emitter.lock().expect("emitter lock").chain().to_vec() };
-    assert_eq!(chain.len(), 2, "fetch receipt + execute receipt");
-    assert_eq!(chain[0].action, "fetch");
-    assert_eq!(chain[0].path, "https://localhost/ok");
-    assert_eq!(chain[0].size, body.len() as u64);
-    assert_eq!(chain[0].result, expected_hash);
-    assert_eq!(chain[1].action, "execute");
+    // With two-phase Execute (Prepare+Commit), chain has: prepare + fetch + commit = 3 receipts
+    // Order: prepare (created first) -> fetch (during WASM execution in commit) -> commit (final)
     assert_eq!(
-        chain[1].path, "https://localhost/ok",
-        "execute receipt path = fetched URL (REQ-610)"
+        chain.len(),
+        3,
+        "prepare receipt + fetch receipt + execute commit receipt"
+    );
+    // chain[0] is prepare receipt (phase="prepare", result="pending")
+    assert_eq!(chain[0].action, "execute");
+    assert_eq!(chain[0].phase, "prepare");
+    assert_eq!(chain[0].result, "pending");
+    // chain[1] is fetch receipt
+    assert_eq!(chain[1].action, "fetch");
+    assert_eq!(chain[1].path, "https://localhost/ok");
+    assert_eq!(chain[1].size, body.len() as u64);
+    assert_eq!(chain[1].result, expected_hash);
+    // chain[2] is commit receipt (phase="commit")
+    assert_eq!(chain[2].action, "execute");
+    assert_eq!(chain[2].phase, "commit");
+    assert_eq!(
+        chain[2].path, "https://localhost/ok",
+        "execute commit receipt path = fetched URL (REQ-610)"
     );
     assert_eq!(
-        chain[1].result, expected_hash,
-        "execute receipt result = BLAKE3(body) hex (REQ-610)"
+        chain[2].result, expected_hash,
+        "execute commit receipt result = BLAKE3(body) hex (REQ-610)"
     );
     assert_eq!(
-        chain[1].size,
+        chain[2].size,
         body.len() as u64,
-        "execute receipt size = body bytes (REQ-610)"
+        "execute commit receipt size = body bytes (REQ-610)"
     );
 
-    // The response embeds the exact execute receipt from the shared chain.
+    // The response embeds the exact execute commit receipt from the shared chain.
     assert_eq!(
         resp.receipt,
-        serde_json::to_vec(chain.last().expect("execute receipt"))?,
+        serde_json::to_vec(chain.last().expect("execute commit receipt"))?,
         "ExecuteResponse.receipt must serialize the chain's last receipt"
     );
 
