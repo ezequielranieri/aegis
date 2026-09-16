@@ -12,7 +12,7 @@ use crate::capabilities::{default_allowed_methods, Capability, FilesystemReadPar
 use serde::de::Error as SerdeError;
 
 /// Configuration parsed from a TOML config file (REQ-302)
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct PolicyConfig {
     pub capabilities: Vec<CapabilityDef>,
     #[serde(default)]
@@ -27,7 +27,7 @@ pub struct ReceiptsConfig {
 
 /// Capability definition from TOML — uses `serde(tag = "name")` for
 /// internally-tagged enum deserialization (REQ-302, REQ-308).
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "name")]
 pub enum CapabilityDef {
     #[serde(rename = "filesystem.read")]
@@ -47,6 +47,10 @@ pub enum CapabilityDef {
         allowed_methods: Vec<String>,
         max_requests_per_second: u64,
     },
+    /// Marker capability to enable two-phase Execute RPCs (ExecutePrepare/Commit/Abort).
+    /// No parameters — presence alone grants access.
+    #[serde(rename = "two_phase_receipts")]
+    TwoPhaseReceipts,
 }
 
 /// Errors during config loading and validation (REQ-308)
@@ -161,6 +165,7 @@ impl PolicyConfig {
             "filesystem.read".to_string(),
             "filesystem.write".to_string(),
             "network.http".to_string(),
+            "two_phase_receipts".to_string(),
         ]
     }
 
@@ -271,6 +276,9 @@ impl PolicyConfig {
                         });
                     }
                 }
+                CapabilityDef::TwoPhaseReceipts => {
+                    // Marker capability — no parameters to validate
+                }
             }
         }
 
@@ -292,6 +300,7 @@ impl CapabilityDef {
             CapabilityDef::FilesystemRead { .. } => "filesystem.read",
             CapabilityDef::FilesystemWrite { .. } => "filesystem.write",
             CapabilityDef::NetworkHttp { .. } => "network.http",
+            CapabilityDef::TwoPhaseReceipts => "two_phase_receipts",
         }
     }
 
@@ -360,6 +369,7 @@ impl CapabilityDef {
                     max_requests_per_second,
                 },
             )),
+            CapabilityDef::TwoPhaseReceipts => Ok(Capability::TwoPhaseReceipts),
         }
     }
 }
@@ -389,6 +399,21 @@ fn is_invalid_host(host: &str) -> bool {
 fn default_config_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/.config/aegis/config.toml", home)
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        // Minimal valid config for testing: a single filesystem.read capability
+        // with a temp directory as allowed_root
+        let tmp = std::env::temp_dir();
+        PolicyConfig {
+            capabilities: vec![CapabilityDef::FilesystemRead {
+                allowed_root: tmp.to_string_lossy().to_string(),
+                max_read_bytes: 1024,
+            }],
+            receipts: None,
+        }
+    }
 }
 
 #[cfg(test)]

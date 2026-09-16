@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex as TokioMutex;
 
 use anyhow::{bail, Result};
 use ring::signature::Ed25519KeyPair;
@@ -102,6 +103,11 @@ impl From<&Capability> for CapabilityConfig {
                 name: "network.http".to_string(),
                 allowed_root: PathBuf::new(),
                 max_bytes: params.max_requests_per_second,
+            },
+            Capability::TwoPhaseReceipts => Self {
+                name: "two_phase_receipts".to_string(),
+                allowed_root: PathBuf::new(),
+                max_bytes: 0,
             },
         }
     }
@@ -357,6 +363,14 @@ pub struct Sandbox {
     budget_resolved: u64,
 }
 
+impl std::fmt::Debug for Sandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sandbox")
+            .field("budget_resolved", &self.budget_resolved)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Sandbox {
     /// Creates a new sandbox with the given configuration.
     ///
@@ -544,6 +558,9 @@ impl Sandbox {
                         },
                     )?;
                 }
+                Capability::TwoPhaseReceipts => {
+                    // Marker capability — no host functions to register
+                }
             }
         }
 
@@ -619,6 +636,29 @@ impl Sandbox {
     /// Returns a reference to the shared `Arc<Mutex<ReceiptEmitter>>`.
     pub fn get_receipt_emitter(&self) -> Option<&Arc<Mutex<ReceiptEmitter>>> {
         self.store.data().receipt_emitter.as_ref()
+    }
+}
+
+/// Opaque handle to a sandbox instance for two-phase reuse.
+///
+/// Held by `ReceiptEmitter::PendingReceipt`, released on Commit/Abort.
+/// Uses `tokio::sync::Mutex` to allow holding the lock across `.await` points.
+#[derive(Debug, Clone)]
+pub struct SandboxHandle {
+    inner: Arc<TokioMutex<Sandbox>>,
+}
+
+impl SandboxHandle {
+    /// Creates a new handle wrapping the given sandbox.
+    pub fn new(sandbox: Sandbox) -> Self {
+        Self {
+            inner: Arc::new(TokioMutex::new(sandbox)),
+        }
+    }
+
+    /// Acquires a lock on the sandbox for exclusive access.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, Sandbox> {
+        self.inner.lock().await
     }
 }
 

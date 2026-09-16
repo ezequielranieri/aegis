@@ -3,8 +3,15 @@ syntax = "proto3";
 package aegis.v1;
 
 service AegisRuntime {
-  // Execute a capability and return result + signed receipt
+  // Legacy single-phase Execute (DEPRECATED: use ExecutePrepare + ExecuteCommit/Abort)
   rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // Two-phase execution: Prepare creates sandbox + signs pending receipt
+  rpc ExecutePrepare(ExecutePrepareRequest) returns (ExecutePrepareResponse);
+  // Commit executes WASM in prepared sandbox + finalizes receipt
+  rpc ExecuteCommit(ExecuteCommitRequest) returns (ExecuteCommitResponse);
+  // Abort discards pending receipt + sandbox
+  rpc ExecuteAbort(ExecuteAbortRequest) returns (ExecuteAbortResponse);
 
   // Verify a chain of receipts against a public key
   rpc VerifyChain(VerifyChainRequest) returns (VerifyChainResponse);
@@ -30,6 +37,40 @@ message ExecuteResponse {
   bytes result = 2;
   bytes receipt = 3;
   string error_message = 4;
+}
+
+message ExecutePrepareRequest {
+  string capability_name = 1;
+  bytes config = 2;
+  bytes wasm_module = 3;
+}
+
+message ExecutePrepareResponse {
+  bool success = 1;
+  bytes receipt = 2;           // JSON ExecutionReceipt phase="prepare"
+  string prepare_hash = 3;     // hex-encoded pending_hash (32 bytes)
+  string error_message = 4;
+}
+
+message ExecuteCommitRequest {
+  string prepare_hash = 1;
+  bytes result = 2;
+}
+
+message ExecuteCommitResponse {
+  bool success = 1;
+  bytes receipt = 2;           // JSON ExecutionReceipt phase="commit"
+  string error_message = 3;
+}
+
+message ExecuteAbortRequest {
+  string prepare_hash = 1;
+}
+
+message ExecuteAbortResponse {
+  bool success = 1;
+  bytes receipt = 2;           // JSON ExecutionReceipt phase="abort"
+  string error_message = 3;
 }
 
 message VerifyChainRequest {

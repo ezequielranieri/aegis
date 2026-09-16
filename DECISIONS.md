@@ -626,6 +626,8 @@ Adopt the six design decisions D1..D6 from the Phase 7 design as the network cap
 | AD-013 | Phase 6 scope | Scope creep cuts | `network.http`, WASI, fuel, two-phase emission deferred |
 | AD-014 | REQ-601..REQ-610, S-601..S-606 | D1..D6 | `aegis_http_fetch` host fn + `FetchRecord`-backed execute receipt |
 | AD-015 | REQ-001, REQ-400, REQ-715, REQ-717, REQ-723 | §3, §4, §6, §7 | `consume_fuel(true)` + `set_fuel` + `fuel_consumed` on Execute receipts |
+| AD-016 | REQ-755, AD-005 class | §5, ADR-016 | Commit signing failure — documented gap with external compensation |
+
 ---
 
 ## AD-015: Fuel Metering via Wasmtime `consume_fuel`
@@ -661,3 +663,72 @@ Enable wasmtime `consume_fuel` at engine creation for every sandbox (REQ-001), s
 - Tests: `tests/fuel.rs` (S-801, S-802, E-803, E-804, E-805), `src/sandbox/mod.rs` (E-801, E-801-inverse), `src/receipts/mod.rs` (E-802, S-803), `src/config/runtime.rs` (E-804, E-805)
 - Precedent: Phase 7 AD-014/D6 (documentation in same work unit as code)
 
+---
+
+## AD-016: Commit Signing Failure — Documented Gap with External Compensation
+
+**Date**: 2026-09-15
+**Phase**: 9 (two-phase receipts)
+**Status**: Accepted
+
+### Context
+
+Two-phase receipts (Phase 9) introduce a signed `prepare` receipt before WASM executes. The flow:
+
+1. `ExecutePrepare` → sandbox created + `prepare` receipt signed (`phase="prepare"`, `result="pending"`, `pending_hash = blake3(prev_hash || prepare_canonical)`) → `prepare_hash` returned to caller
+2. `ExecuteCommit` → WASM executes in prepared sandbox → result/fuel captured → `commit` receipt signed with `phase="commit"`, `pending_hash` copied from prepare → `prepare` entry removed from pending map
+
+**The gap**: If `ExecuteCommit` executes WASM (host side-effects are real and committed — e.g., `aegis_fs_write` performs atomic `rename()`) → **final `commit` signing fails** (disk full, key corruption, clock skew, lock contention, test-forced failure): the side effects are real and committed, but no `commit` receipt is produced.
+
+This is the same mitigation class as **AD-005** (S-416-W-after-rename): a signed receipt exists *before* the side effect, but the final receipt fails to materialize.
+
+### Decision
+
+Same mitigation class as AD-005:
+
+1. The signed `prepare` receipt (`phase="prepare"`) **exists in the chain** — proves intent and pre-execution state
+2. `ReceiptEmitter` emits an `abort` receipt with `phase="abort"`, `pending_hash` = prepare's `pending_hash`, `result="aborted"`, `error="commit_signing_failed"`, `fuel_consumed=0`
+3. The receipt chain shows: `prepare` → `abort(commit_signing_failed)`
+4. **External compensation required**: audit log entry + operator alert (identical to AD-005 pattern)
+5. This is a **known gap with documented mitigation** — NOT a silent failure
+
+### Verifier Behavior
+
+`ReceiptChain::verify_chain` accepts `prepare` → `abort(commit_signing_failed)` as a valid terminal chain. The `pending_hash` matches, `prev_hash` of abort equals prepare's `pending_hash`, and the state machine clears `expected_pending_hash` after abort.
+
+### Pending Hash Bootstrap (WU3/WU4)
+
+**Critical implementation detail**: The `pending_hash` in the `prepare` receipt is computed as `blake3(prev_hash || prepare_canonical_bytes_without_pending_hash)`. Because the `pending_hash` field appears in the canonical bytes, there's a circular dependency:
+
+- `pending_hash` is derived from the prepare receipt's canonical bytes
+- But the prepare receipt *contains* `pending_hash` as a field
+
+**Solution** (implemented in WU3/WU4):
+1. Create a temporary prepare receipt with `pending_hash = [0;32]` and a **fixed timestamp**
+2. Compute `pending_hash = blake3(prev_hash || canonical_bytes_of_temp_receipt)`
+3. Create the final prepare receipt with the computed `pending_hash` and the **same fixed timestamp**, then re-sign
+3. Verifier uses `canonical_bytes_for_chain_without_pending_hash()` (which zeroes `pending_hash` before hashing) to recompute and verify the same `pending_hash`
+
+The fixed timestamp ensures the canonical bytes are identical between the hash-computation pass and the final signing pass. The verifier zeroes `pending_hash` during its recomputation to match the original bootstrap.
+
+### Alternatives Considered
+
+- **Auto-retry signing (3×)**: Masks root cause (key corruption, disk full), adds latency, no guarantee
+- **Emit unsigned receipt + flag**: Breaks chain verification invariants (all receipts must be signed)
+- **Block Commit until signing succeeds**: Unbounded wait, no progress guarantee
+
+### Consequences
+
+- Operators MUST monitor for `abort` receipts with `error="commit_signing_failed"` and correlate with host side-effects
+- Audit log integration (out of scope for v1) will automate this correlation
+- Verifier accepts prepare→abort as valid terminal chain (REQ-760)
+- AD-016 recorded in DECISIONS.md same work unit as code (AD-014 D6 precedent)
+
+### Traceability
+
+- Design: `openspec/changes/phase9-two-phase-receipts/design.md` §5, ADR-016
+- Spec: `openspec/changes/phase9-two-phase-receipts/specs/grpc-runtime-server/spec.md` REQ-755
+- Related: AD-005 (S-416-W-after-rename gap, same mitigation class)
+- Tests: `tests/two_phase.rs` — `commit_signing_failed` forced test validates prepare exists + abort with `error="commit_signing_failed"` emitted
+
+---

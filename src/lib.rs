@@ -28,7 +28,7 @@ pub mod proto {
 pub use config::runtime::{ExecutionConfig, RuntimeConfig, ServerConfig, TlsConfig};
 pub use config::{CapabilityDef, ConfigError, PolicyConfig, ReceiptsConfig};
 pub use sandbox::{
-    load_receipt_keypair, CapabilityConfig, EpochInterrupter, Sandbox, SandboxConfig,
+    load_receipt_keypair, CapabilityConfig, EpochInterrupter, Sandbox, SandboxConfig, SandboxHandle,
 };
 
 /// Initialize the Aegis runtime

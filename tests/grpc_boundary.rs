@@ -779,7 +779,12 @@ async fn get_receipt_chain_returns_chain() -> Result<()> {
         }
         assert!(!receipt.result.is_empty(), "Receipt result must be hash");
     }
-    assert_eq!(execute_count, 2, "Expected 2 execute receipts");
+    // With two-phase Execute (Prepare+Commit), each legacy Execute call generates
+    // 2 receipts (prepare + commit), so 2 calls = 4 execute receipts.
+    assert_eq!(
+        execute_count, 4,
+        "Expected 4 execute receipts (2 prepare + 2 commit)"
+    );
     assert_eq!(read_count, 2, "Expected 2 read receipts");
 
     let _ = server._shutdown.send(());
@@ -832,10 +837,18 @@ async fn verify_chain_valid_via_grpc() -> Result<()> {
     };
     let verify_resp = client.verify_chain(Request::new(verify_req)).await?;
 
+    // Debug: print verification result
+    eprintln!(
+        "Verify response: valid={}, error='{}'",
+        verify_resp.get_ref().valid,
+        verify_resp.get_ref().error_message
+    );
+
     // Chain should be valid
     assert!(
         verify_resp.get_ref().valid,
-        "Valid chain should verify as true"
+        "Valid chain should verify as true, error: {}",
+        verify_resp.get_ref().error_message
     );
     assert!(
         verify_resp.get_ref().error_message.is_empty(),

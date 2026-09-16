@@ -14,6 +14,10 @@ pub enum Capability {
     FilesystemWrite(FilesystemWriteParams),
     #[serde(rename = "network.http")]
     NetworkHttp(NetworkHttpParams),
+    /// Marker capability to enable two-phase Execute RPCs (ExecutePrepare/Commit/Abort).
+    /// No parameters — presence alone grants access.
+    #[serde(rename = "two_phase_receipts")]
+    TwoPhaseReceipts,
 }
 
 /// Parameters for filesystem.read capability (REQ-202)
@@ -51,6 +55,7 @@ impl Capability {
             Capability::FilesystemRead(_) => "filesystem.read",
             Capability::FilesystemWrite(_) => "filesystem.write",
             Capability::NetworkHttp(_) => "network.http",
+            Capability::TwoPhaseReceipts => "two_phase_receipts",
         }
     }
 }
@@ -65,6 +70,7 @@ pub mod builtin {
     pub const FILESYSTEM_READ: &str = "filesystem.read";
     pub const FILESYSTEM_WRITE: &str = "filesystem.write";
     pub const NETWORK_HTTP: &str = "network.http";
+    pub const TWO_PHASE_RECEIPTS: &str = "two_phase_receipts";
     pub const CRYPTO_SIGN: &str = "crypto.sign";
     pub const CRYPTO_VERIFY: &str = "crypto.verify";
 }
