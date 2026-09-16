@@ -5,20 +5,21 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Global mutex to serialize fuel tests — they all set/remove AEGIS_TEST_MODE
 /// which is process-global state. Without serialization, parallel tests clobber
 /// each other's env var and fail with "WASM execution trapped" instead of
-/// the expected classification.
-static FUEL_TEST_MUTEX: OnceLock<StdMutex<()>> = OnceLock::new();
+/// the expected classification. Async mutex so the guard is never held across
+/// an await point (clippy::await_holding_lock).
+static FUEL_TEST_MUTEX: OnceLock<TokioMutex<()>> = OnceLock::new();
 
-fn fuel_test_lock() -> std::sync::MutexGuard<'static, ()> {
+async fn fuel_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
     FUEL_TEST_MUTEX
-        .get_or_init(|| StdMutex::new(()))
+        .get_or_init(|| TokioMutex::new(()))
         .lock()
-        .unwrap()
+        .await
 }
 
 use anyhow::Result;
@@ -26,22 +27,17 @@ use base64::Engine;
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair as RcgenKeyPair,
 };
-use ring::signature::KeyPair as RingKeyPair;
 use tempfile::TempDir;
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex as TokioMutex, task::JoinHandle};
 use tonic::transport::{Certificate as TonicCertificate, Channel, ClientTlsConfig, Identity};
 use tonic::Request;
 
 use aegis::config::runtime::{
     ExecutionConfig, ReceiptsConfig, RuntimeConfig, ServerConfig, TlsConfig,
 };
-use aegis::grpc::server::{start_server_internal, start_server_internal_with_emitter};
-use aegis::proto::aegis::v1::{
-    aegis_runtime_client::AegisRuntimeClient, ExecuteRequest, GetReceiptChainRequest,
-    VerifyChainRequest,
-};
-use aegis::receipts::{ExecutionReceipt, ReceiptEmitter};
-use aegis::sandbox::load_receipt_keypair;
+use aegis::grpc::server::start_server_internal;
+use aegis::proto::aegis::v1::{aegis_runtime_client::AegisRuntimeClient, ExecuteRequest};
+use aegis::receipts::ExecutionReceipt;
 
 /// Enable test mode for the gRPC handler (disables epoch interruption)
 fn enable_test_mode() {
@@ -351,7 +347,7 @@ async fn run_execute_test(
     wasm: Vec<u8>,
     config: Vec<u8>,
 ) -> Result<tonic::Response<aegis::proto::aegis::v1::ExecuteResponse>> {
-    let _lock = fuel_test_lock();
+    let _lock = fuel_test_lock().await;
     enable_test_mode();
     let config_struct = create_test_config(certs, port, fuel_budget);
     let server = TestServer::start(config_struct).await?;

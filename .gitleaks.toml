@@ -1,0 +1,14 @@
+# aegis gitleaks config
+#
+# Secret scanning configuration for the aegis repository.
+# Only template/sample files are allowlisted: they contain placeholder
+# values or paths, never real credentials.
+
+title = "aegis gitleaks config"
+
+[allowlist]
+description = "Combined allowlist for false positives (template/sample files)"
+files = [
+  "config/runtime.toml.example",
+  "openspec/config/aegis-keys.toml",
+]

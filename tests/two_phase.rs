@@ -26,7 +26,7 @@ use aegis::config::runtime::{
 use aegis::grpc::server::{start_server_internal, start_server_internal_with_emitter};
 use aegis::proto::aegis::v1::{
     aegis_runtime_client::AegisRuntimeClient, ExecuteAbortRequest, ExecuteCommitRequest,
-    ExecutePrepareRequest, ExecuteRequest, GetReceiptChainRequest, VerifyChainRequest,
+    ExecutePrepareRequest, GetReceiptChainRequest, VerifyChainRequest,
 };
 use aegis::receipts::{ExecutionReceipt, ReceiptEmitter};
 use aegis::sandbox::load_receipt_keypair;
@@ -342,7 +342,7 @@ fn execute_abort_request(prepare_hash: &str) -> ExecuteAbortRequest {
 }
 
 /// Parse JSON receipt bytes into ExecutionReceipt
-fn parse_receipt(bytes: &Vec<u8>) -> ExecutionReceipt {
+fn parse_receipt(bytes: &[u8]) -> ExecutionReceipt {
     serde_json::from_slice(bytes).expect("valid JSON receipt")
 }
 
@@ -439,7 +439,7 @@ async fn execute_prepare_then_commit_happy_path() -> Result<()> {
         let emitter = _emitter.lock().unwrap();
         emitter.public_key()
     };
-    let chain = vec![prepare_receipt, commit_receipt];
+    let chain = [prepare_receipt, commit_receipt];
     let verify_req = VerifyChainRequest {
         receipts: chain
             .iter()
@@ -522,7 +522,7 @@ async fn execute_prepare_then_abort() -> Result<()> {
         let emitter = _emitter.lock().unwrap();
         emitter.public_key()
     };
-    let chain = vec![prepare_receipt, abort_receipt];
+    let chain = [prepare_receipt, abort_receipt];
     let verify_req = VerifyChainRequest {
         receipts: chain
             .iter()
@@ -666,8 +666,11 @@ async fn legacy_execute_commit_signing_failure_emits_abort() -> Result<()> {
         .get_receipt_chain(Request::new(chain_req))
         .await?
         .into_inner();
-    let chain_receipts: Vec<ExecutionReceipt> =
-        chain_resp.receipts.iter().map(parse_receipt).collect();
+    let chain_receipts: Vec<ExecutionReceipt> = chain_resp
+        .receipts
+        .iter()
+        .map(|b| parse_receipt(b))
+        .collect();
 
     // Should have prepare + legacy fs_read + abort (host function emits legacy receipt during WASM execution)
     assert_eq!(
@@ -708,8 +711,11 @@ async fn legacy_execute_commit_signing_failure_emits_abort() -> Result<()> {
         3,
         "chain should have prepare + legacy fs_read + abort"
     );
-    let chain_receipts: Vec<ExecutionReceipt> =
-        chain_resp.receipts.iter().map(parse_receipt).collect();
+    let chain_receipts: Vec<ExecutionReceipt> = chain_resp
+        .receipts
+        .iter()
+        .map(|b| parse_receipt(b))
+        .collect();
     assert_eq!(chain_receipts[0].phase, "prepare");
     assert_eq!(chain_receipts[1].phase, ""); // legacy fs_read receipt from host function
     assert_eq!(chain_receipts[2].phase, "abort");
@@ -778,8 +784,11 @@ async fn legacy_execute_uses_two_phase_internally() -> Result<()> {
         .get_receipt_chain(Request::new(chain_req))
         .await?
         .into_inner();
-    let chain_receipts: Vec<ExecutionReceipt> =
-        chain_resp.receipts.iter().map(parse_receipt).collect();
+    let chain_receipts: Vec<ExecutionReceipt> = chain_resp
+        .receipts
+        .iter()
+        .map(|b| parse_receipt(b))
+        .collect();
 
     // Chain should have prepare + legacy fs_read + commit (host function emits legacy receipt)
     assert_eq!(
@@ -979,8 +988,11 @@ async fn get_receipt_chain_returns_two_phase_chain() -> Result<()> {
             i, receipt.phase, receipt.capability_name, receipt.prev_hash
         );
     }
-    let chain_receipts: Vec<ExecutionReceipt> =
-        chain_resp.receipts.iter().map(parse_receipt).collect();
+    let chain_receipts: Vec<ExecutionReceipt> = chain_resp
+        .receipts
+        .iter()
+        .map(|b| parse_receipt(b))
+        .collect();
 
     assert_eq!(chain_receipts.len(), 5);
     assert_eq!(chain_receipts[0].phase, "prepare");

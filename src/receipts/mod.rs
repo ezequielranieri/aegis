@@ -1421,7 +1421,7 @@ mod tests {
 
         let config = crate::config::PolicyConfig::default();
         let wasm_module = wat::parse_str("(module)").unwrap();
-        let (prepare_receipt, handle) = emitter
+        let (_prepare_receipt, handle) = emitter
             .prepare("execute", config.clone(), &wasm_module, Some(1000))
             .unwrap();
 
@@ -1446,7 +1446,7 @@ mod tests {
 
         let config = crate::config::PolicyConfig::default();
         let wasm_module = wat::parse_str("(module)").unwrap();
-        let (prepare_receipt, handle) = emitter
+        let (_prepare_receipt, handle) = emitter
             .prepare("execute", config.clone(), &wasm_module, Some(1000))
             .unwrap();
 
@@ -1467,7 +1467,7 @@ mod tests {
 
         let config = crate::config::PolicyConfig::default();
         let wasm_module = wat::parse_str("(module)").unwrap();
-        let (prepare_receipt, handle) = emitter
+        let (_prepare_receipt, handle) = emitter
             .prepare("execute", config.clone(), &wasm_module, Some(1000))
             .unwrap();
 
