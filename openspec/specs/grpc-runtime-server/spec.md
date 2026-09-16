@@ -24,7 +24,8 @@ gRPC server exposing aegis WASM runtime capabilities (Execute, VerifyChain, GetR
 | REQ-713 | System SHALL serve over h2 (HTTP/2) with **mutual TLS (mTLS) required** (TLS 1.2+). Server presents its certificate; client MUST present a valid certificate signed by the configured CA. Requests without valid client certificate are rejected. | MUST |
 | REQ-716 | System SHALL validate client certificates against the configured CA certificate (`ca_cert_path` in config). Client certificate MUST include the expected identity (e.g., `agent-gateway` as CN or SAN). Requests with invalid, expired, or mismatched client certificates are rejected with `INVALID_CERT` gRPC status. | MUST |
 | REQ-714 | Execute RPC SHALL create a sandbox per request from the provided config and run the capability | MUST |
-| REQ-715 | Execute RPC SHALL trap and return `success=false` on any violation (path escape, traversal, size exceed) — fail-closed | MUST |
+| REQ-715 | Execute RPC SHALL trap and return `success=false` on any violation (path escape, traversal, size exceed, fuel budget exceeded) — fail-closed | MUST |
+| REQ-717 | System SHALL accept an optional `execution.fuel_budget` (`Option<u64>`) in `RuntimeConfig`. When absent, the system SHALL apply a generous default budget calibrated by a design spike over the existing filesystem and network E2E suites — the default is design-calibrated and SHALL NOT be specified as a normative constant in this spec. When present, the system SHALL honor the configured value as the per-execution budget. Configurations without the key SHALL parse unchanged. | MUST |
 
 ## Scenarios
 
@@ -43,15 +44,21 @@ gRPC server exposing aegis WASM runtime capabilities (Execute, VerifyChain, GetR
 | S-710 | mTLS rejects invalid client cert | Valid TLS cert/key + `ca_cert_path`, client presents self-signed or wrong CA cert | Client sends ExecuteRequest | Request rejected with INVALID_CERT, no execution |
 | S-711 | mTLS rejects missing client cert | Valid TLS cert/key + `ca_cert_path`, client connects without client cert | Client sends ExecuteRequest | Request rejected with INVALID_CERT, no execution |
 | S-712 | Server shutdown | Server is running, active RPCs in progress | SIGTERM received | Server drains active RPCs, then exits |
+| S-801 | Execute success reports fuel | Fresh sandbox with budget; module consumes fuel | Execute RPC succeeds | `success=true`; receipt carries `fuel_consumed` > 0 equal to `effective_budget - get_fuel()` |
+| S-802 | Execute fuel exhaustion | Module consumes its full budget | Execute RPC runs | Deterministic trap; receipt carries `fuel_consumed`; `success=false` with `error_message` `"fuel budget exceeded"` |
+| E-803 | D4 arm isolation | Execution traps from fuel exhaustion; module also holds fs/network capabilities | D4 cascade classifies the trap | Classified `"fuel budget exceeded"` — never the fs `size limit exceeded` or network branches; network traps still classified by the network guard (first branch) |
+| E-804 | Budget absent | `runtime.toml` without `execution.fuel_budget` | Config parsed; Execute runs | Parses unchanged; design-calibrated default applied as effective budget |
+| E-805 | Budget explicit | `execution.fuel_budget` set to a value `n` | Execute runs | `n` honored as the effective budget |
 
 ## Traceability
 
 | Requirement | Scenario(s) |
 |-------------|-------------|
-| REQ-701, REQ-714, REQ-715 | S-700, S-701, S-702 |
+| REQ-701, REQ-714, REQ-715 | S-700, S-701, S-702, S-801, S-802, E-803 |
 | REQ-702 | S-703, S-704 |
 | REQ-703 | S-705 |
 | REQ-704, REQ-706 | S-706, S-707 |
 | REQ-705, REQ-706 | S-706, S-707 |
 | REQ-713, REQ-716 | S-708, S-709, S-710, S-711 |
 | REQ-700 | S-712 |
+| REQ-717 | S-801, E-804, E-805 |

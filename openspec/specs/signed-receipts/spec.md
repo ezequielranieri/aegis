@@ -22,6 +22,10 @@ Signing failure SHALL propagate as error, never produce unsigned receipt. If `em
 
 ## ADDED Requirements
 
+### REQ-723: fuel_consumed on Execute Receipts
+
+Execute receipts SHALL carry `fuel_consumed: u64` reporting the fuel consumed by the execution, measured as `effective_budget - Store::get_fuel()` after the call returns. The field SHALL be serialized with `skip_serializing_if = "is_zero"` and SHALL be declared last, after `timestamp_ns`, so receipts with `fuel_consumed == 0` serialize byte-identically to the pre-change schema and existing chains keep verifying with zero verifier changes. In v1 the field SHALL appear on Execute receipts only — success and trap paths; capability receipts (filesystem/network host functions) SHALL NOT gain fuel semantics.
+
 ### REQ-720: Key Bound to Runtime Process
 
 The Ed25519 private key SHALL be loaded once at `aegis-runtime` startup and remain in `ReceiptEmitter` for the lifetime of the process. The private key MUST NOT be accessible via any gRPC RPC — neither as a request field nor as a response field.
@@ -38,6 +42,8 @@ The optional CLI verifier (`aegis-verify`) SHALL continue to work unchanged. It 
 
 | # | Scenario | Given | When | Then |
 |---|----------|-------|------|------|
+| S-803 | Capability receipt without fuel | Filesystem/network host function emits a receipt | Receipt serialized | `fuel_consumed` absent (skip-if-zero); schema unchanged |
+| E-802 | fuel=0 byte-identical golden compat | Execute receipt with `fuel_consumed == 0` | Canonical bytes computed | Byte-identical to the pre-change schema (golden test); old chains verify unchanged |
 | S-720 | Key never over gRPC | Server running with loaded key | Any RPC executed | Private key bytes not present in any request or response protobuf message |
 | S-721 | Execute signing failure via gRPC | Corrupt key loaded at startup | ExecuteRequest received | ExecuteResponse with success=false, error_message indicates signing failure |
 | S-722 | CLI verifier after gRPC execution | Receipts emitted via gRPC Execute RPC, public key available | CLI verifier runs against exported receipt chain JSON | Verification succeeds with correct public key |
@@ -53,3 +59,4 @@ The optional CLI verifier (`aegis-verify`) SHALL continue to work unchanged. It 
 | REQ-720 | S-720 |
 | REQ-721 | S-720 |
 | REQ-722 | S-722 |
+| REQ-723 | S-803, E-802 |
