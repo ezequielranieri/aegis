@@ -22,6 +22,7 @@ use crate::sandbox::{Sandbox, SandboxConfig};
 pub struct AegisRuntimeService {
     pub receipt_emitter: Arc<Mutex<ReceiptEmitter>>,
     pub semaphore: Arc<Semaphore>,
+    pub fuel_budget: Option<u64>,
 }
 
 #[tonic::async_trait]
@@ -69,19 +70,19 @@ impl AegisRuntime for AegisRuntimeService {
 
         // 4. Create sandbox for this request
         // Check for test mode to disable epoch interruption entirely (avoids "wasm trap: interrupt" in tests)
+        // Fuel metering stays on in both modes (E-804/E-805); only epoch differs.
         let test_mode = std::env::var("AEGIS_TEST_MODE").is_ok();
-        let mut sandbox = if test_mode {
-            // Disable epoch interruption entirely for tests (like unit tests do)
-            Sandbox::new_with_config(SandboxConfig::default(), false).map_err(|e| {
-                tracing::error!(error = %e, "failed to create sandbox");
-                Status::internal(format!("failed to create sandbox: {}", e))
-            })?
-        } else {
-            Sandbox::new_with_limits(SandboxConfig::default()).map_err(|e| {
-                tracing::error!(error = %e, "failed to create sandbox");
-                Status::internal(format!("failed to create sandbox: {}", e))
-            })?
-        };
+        let mut sandbox = Sandbox::new_with_config(
+            SandboxConfig {
+                fuel_budget: self.fuel_budget,
+                ..SandboxConfig::default()
+            },
+            !test_mode, // enable_epoch = !test_mode (test_mode=true means disable epoch)
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to create sandbox");
+            Status::internal(format!("failed to create sandbox: {}", e))
+        })?;
 
         // 5. Set the shared receipt emitter on the sandbox
         sandbox.store_mut().data_mut().receipt_emitter = Some(self.receipt_emitter.clone());
@@ -118,6 +119,10 @@ impl AegisRuntime for AegisRuntimeService {
         let result_bytes = self
             .execute_wasm_capability(&mut sandbox, &capabilities, &wasm_module_bytes)
             .await;
+
+        // Capture fuel consumed post-call (works for both success and trap paths).
+        // get_fuel() returns remaining fuel; budget_resolved - remaining = consumed.
+        let fuel_consumed = sandbox.fuel_consumed();
 
         tracing::debug!("DEBUG execute: wasm execution result = {:?}", result_bytes);
 
@@ -163,6 +168,7 @@ impl AegisRuntime for AegisRuntimeService {
                             &capability_path,
                             size,
                             &result_hash,
+                            fuel_consumed,
                         )
                         .map_err(|e| Status::internal(format!("receipt emission failed: {}", e)))?;
                 }
@@ -188,10 +194,17 @@ impl AegisRuntime for AegisRuntimeService {
                 }))
             }
             Err(status) => {
-                // Emit trap receipt on failure
-                if let Ok(mut emitter) = self.receipt_emitter.lock() {
-                    let _ = emitter.emit(&capability_name, "execute", "", 0, "trap");
-                }
+                // Emit trap receipt on failure (with fuel_consumed captured post-call)
+                let trap_receipt = if let Ok(mut emitter) = self.receipt_emitter.lock() {
+                    emitter
+                        .emit(&capability_name, "execute", "", 0, "trap", fuel_consumed)
+                        .ok()
+                } else {
+                    None
+                };
+                let trap_receipt_bytes = trap_receipt
+                    .map(|r| serde_json::to_vec(&r).expect("receipt serialization should not fail"))
+                    .unwrap_or_default();
 
                 // For capability violations (traversal, size exceed) and signing failures,
                 // return success=false instead of gRPC error status, per REQ-715 / S-701, S-702
@@ -201,7 +214,7 @@ impl AegisRuntime for AegisRuntimeService {
                     Ok(Response::new(ExecuteResponse {
                         success: false,
                         result: Vec::new(),
-                        receipt: Vec::new(),
+                        receipt: trap_receipt_bytes,
                         error_message: status.message().to_string(),
                     }))
                 } else {
@@ -369,6 +382,13 @@ impl AegisRuntimeService {
                 } else {
                     "WASM execution trapped"
                 }
+            // D4 fuel arm (Phase 8): evaluated after network guard, before fs cascade.
+            // Matches deterministic wasmtime literal "all fuel consumed" from trap_encoding.rs:142.
+            } else if std::iter::successors(e.source(), |s| s.source())
+                .map(|s| s.to_string())
+                .any(|f| f.contains("all fuel consumed"))
+            {
+                "fuel budget exceeded"
             } else if msg.contains("traversal")
                 || msg.contains("..")
                 || msg.contains("outside")

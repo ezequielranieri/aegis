@@ -381,7 +381,10 @@ fn create_test_config(certs: &TestCerts, port: u16) -> RuntimeConfig {
         receipts: ReceiptsConfig {
             key_path: certs.signing_key_path(),
         },
-        execution: ExecutionConfig { max_concurrent: 4 },
+        execution: ExecutionConfig {
+            max_concurrent: 4,
+            fuel_budget: None,
+        },
     }
 }
 
@@ -594,6 +597,7 @@ async fn verify_chain_tampered_receipt_via_grpc() -> Result<()> {
         100,
         [0u8; 32],
         &key_pair,
+        0,
     )?;
 
     // Tamper with the receipt (modify capability_name)

@@ -101,6 +101,7 @@ async fn start_server_with_emitter(
     let aegis_service = AegisRuntimeService {
         receipt_emitter: receipt_emitter.clone(),
         semaphore: Arc::clone(&_semaphore),
+        fuel_budget: config.execution.fuel_budget,
     };
     let health_service = HealthService;
 

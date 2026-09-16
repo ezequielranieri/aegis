@@ -25,9 +25,9 @@ Each receipt's `prev_hash` SHALL equal `blake3(prev_hash ‖ canonical_bytes)`.
 
 ### REQ-412: Genesis prev_hash
 Genesis receipt SHALL have `prev_hash = [0u8; 32]`.
-
 ### REQ-400: ExecutionReceipt Structure
-System SHALL define `ExecutionReceipt` with fields: `capability_name`, `action`, `result`, `prev_hash: [u8; 32]`, `signature: [u8; 64]`, `timestamp_ns: u64`.
+
+System SHALL define `ExecutionReceipt` with fields: `capability_name`, `action`, `result`, `path`, `size`, `prev_hash: [u8; 32]`, `signature: [u8; 64]`, `timestamp_ns: u64`, `fuel_consumed: u64`.
 
 ### REQ-401: Canonical JSON Serialization
 System SHALL serialize receipts via canonical JSON (`serde_json`) using struct field declaration order.
