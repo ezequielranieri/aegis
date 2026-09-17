@@ -6,6 +6,7 @@ Standalone binary entry point for the aegis runtime gRPC service. Loads configur
 
 ## Requirements
 
+
 | Req | Statement | Severity |
 |-----|-----------|----------|
 | REQ-800 | System SHALL provide a standalone binary `aegis-runtime` with its own `[[bin]]` entry in `Cargo.toml` | MUST |
@@ -21,6 +22,10 @@ Standalone binary entry point for the aegis runtime gRPC service. Loads configur
 | REQ-810 | `RuntimeConfig` SHALL contain: `[receipts]` section with `key_path` (string) pointing to Ed25519 key file | MUST |
 | REQ-811 | Binary SHALL NOT export, log, or expose the Ed25519 private key in any form | MUST |
 | REQ-812 | Binary SHALL be buildable via `cargo build --bin aegis-runtime` | MUST |
+| REQ-820 | The `Capability` enum SHALL include a variant for two-phase receipt execution capability. This is **not a new host function capability** — it is a **p | MUST |
+| REQ-821 | `PolicyConfig::try_into_capabilities()` SHALL recognize a `two_phase_receipts = true` (or `[capabilities.two_phase_receipts]`) key in the TOML config  | MUST |
+| REQ-822 | The `ExecutePrepare` RPC handler SHALL validate that `Capability::TwoPhaseReceipts` is present in the granted capabilities. If not granted, return `FA | MUST |
+| REQ-823 | `ExecuteCommit` and `ExecuteAbort` RPCs SHALL NOT re-validate capabilities — they are authorized by virtue of the `prepare_hash` which was issued by a | MUST |
 
 ## Scenarios
 
@@ -37,14 +42,30 @@ Standalone binary entry point for the aegis runtime gRPC service. Loads configur
 | S-808 | mTLS client cert validation | Config includes `ca_cert_path`, client connects with valid client cert signed by CA | Client sends ExecuteRequest | Request succeeds, response with receipt |
 | S-809 | mTLS rejects invalid client cert | Config includes `ca_cert_path`, client connects with self-signed cert or wrong CA | Client sends ExecuteRequest | Request rejected with INVALID_CERT status, no execution |
 | S-810 | mTLS rejects missing client cert | Config includes `ca_cert_path`, client connects without client cert | Client sends ExecuteRequest | Request rejected with INVALID_CERT status, no execution |
+| S-970 | TwoPhaseReceipts granted |  Config with `two_phase_receipts = true` |  ExecutePrepare called |  `success=true`, prepare receipt emitted |
+| S-971 | TwoPhaseReceipts denied |  Config WITHOUT `two_phase_receipts` |  ExecutePrepare called |  `success=false`, "two-phase receipts capability not granted" |
+| S-972 | Legacy Execute works without capability |  Config WITHOUT `two_phase_receipts` |  Legacy Execute called |  Works (backward compat) |
+| S-973 | ExecuteCommit authorized by prepare_hash |  Prepare succeeded, commit called |  ExecuteCommit with prepare_hash |  `success=true`, no capability re-check |
+| S-974 | ExecuteAbort authorized by prepare_hash |  Prepare succeeded, abort called |  ExecuteAbort with prepare_hash |  `success=true`, no capability re-check |
 
 ## Traceability
 
 | Requirement | Scenario(s) |
 |-------------|-------------|
-| REQ-800 | S-800 |
-| REQ-801, REQ-802, REQ-803 | S-800, S-801, S-802 |
-| REQ-804, REQ-805, REQ-812 | S-800 |
-| REQ-806, REQ-807, REQ-808 | S-805 |
-| REQ-809, REQ-810 | S-800, S-806, S-807, S-808, S-809, S-810 |
-| REQ-803, REQ-804, REQ-811 | S-803, S-804 |
+| REQ-800 |  |
+| REQ-801 |  |
+| REQ-802 |  |
+| REQ-803 |  |
+| REQ-804 |  |
+| REQ-805 |  |
+| REQ-806 |  |
+| REQ-807 |  |
+| REQ-808 |  |
+| REQ-809 |  |
+| REQ-810 |  |
+| REQ-811 |  |
+| REQ-812 |  |
+| REQ-820 | S-970, S-971, S-972, S-973, S-974 |
+| REQ-821 | S-970, S-971, S-972, S-973, S-974 |
+| REQ-822 | S-970, S-971, S-972, S-973, S-974 |
+| REQ-823 | S-970, S-971, S-972, S-973, S-974 |
