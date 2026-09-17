@@ -1,6 +1,6 @@
 # Rust
 target/
-Cargo.lock
+# Cargo.lock is committed for reproducible CI builds (binary crate)
 
 # Local Pi runtime state
 .atl/
