@@ -170,6 +170,27 @@ private_key = "{}"
     }
 }
 
+/// Allocate a port free at the moment of the call (bind 127.0.0.1:0, read
+/// the assigned port, then release it for the server to bind).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("read local addr")
+        .port()
+}
+
+/// Wait until the server at `addr` accepts TCP connections (bounded).
+async fn wait_for_server(addr: std::net::SocketAddr) {
+    for _ in 0..250 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("test gRPC server at {addr} did not become ready");
+}
+
 /// Test server handle with address and shutdown.
 struct TestServer {
     addr: std::net::SocketAddr,
@@ -178,7 +199,7 @@ struct TestServer {
 }
 
 impl TestServer {
-    /// Start a test gRPC server on a fixed port with mTLS
+    /// Start a test gRPC server on an ephemeral port with mTLS
     /// Creates the ReceiptEmitter internally (production-like path).
     async fn start(config: RuntimeConfig) -> Result<Self> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -195,8 +216,8 @@ impl TestServer {
         let handle =
             tokio::spawn(async move { start_server_internal(&config, addr, shutdown_fut).await });
 
-        // Wait a bit for server to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the server to accept connections
+        wait_for_server(addr).await;
 
         Ok(Self {
             addr,
@@ -233,8 +254,8 @@ impl TestServer {
                 .await
         });
 
-        // Wait a bit for server to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the server to accept connections
+        wait_for_server(addr).await;
 
         Ok((
             Self {
@@ -361,7 +382,7 @@ async fn execute_prepare_then_commit_happy_path() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "two-phase content")?;
 
-    let config = create_test_config(&certs, 50051);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -474,7 +495,7 @@ async fn execute_prepare_then_abort() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "abort test content")?;
 
-    let config = create_test_config(&certs, 50052);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -556,7 +577,7 @@ async fn execute_prepare_requires_two_phase_capability() -> Result<()> {
     let test_root = TempDir::new()?;
     std::fs::write(test_root.path().join("safe_file.txt"), "content")?;
 
-    let config = create_test_config(&certs, 50053);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -614,7 +635,7 @@ async fn legacy_execute_commit_signing_failure_emits_abort() -> Result<()> {
     std::fs::write(&safe_file, "signing failure test")?;
 
     // Start server with pre-created emitter so we can force signing failure
-    let config = create_test_config(&certs, 50054);
+    let config = create_test_config(&certs, free_port());
     let (server, emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -738,7 +759,7 @@ async fn legacy_execute_uses_two_phase_internally() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "legacy execute test")?;
 
-    let config = create_test_config(&certs, 50055);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -818,7 +839,7 @@ async fn execute_commit_first_succeeds_second_fails() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "idempotent test")?;
 
-    let config = create_test_config(&certs, 50056);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -876,7 +897,7 @@ async fn execute_abort_idempotent() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "idempotent abort test")?;
 
-    let config = create_test_config(&certs, 50057);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -930,7 +951,7 @@ async fn get_receipt_chain_returns_two_phase_chain() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "chain test")?;
 
-    let config = create_test_config(&certs, 50058);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -1039,7 +1060,7 @@ async fn verify_chain_accepts_prepare_commit() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "verify chain test")?;
 
-    let config = create_test_config(&certs, 50059);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -1105,7 +1126,7 @@ async fn verify_chain_accepts_prepare_abort() -> Result<()> {
     let safe_file = test_root.path().join("safe_file.txt");
     std::fs::write(&safe_file, "verify abort test")?;
 
-    let config = create_test_config(&certs, 50060);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -1167,7 +1188,7 @@ async fn execute_commit_unknown_prepare_hash_fails() -> Result<()> {
 
     let certs = TestCerts::generate()?;
 
-    let config = create_test_config(&certs, 50061);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -1198,7 +1219,7 @@ async fn execute_abort_unknown_prepare_hash_fails() -> Result<()> {
 
     let certs = TestCerts::generate()?;
 
-    let config = create_test_config(&certs, 50062);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -1226,7 +1247,7 @@ async fn execute_commit_invalid_prepare_hash_format_fails() -> Result<()> {
 
     let certs = TestCerts::generate()?;
 
-    let config = create_test_config(&certs, 50063);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -1268,7 +1289,7 @@ async fn execute_prepare_empty_wasm_fails() -> Result<()> {
 
     let test_root = TempDir::new()?;
 
-    let config = create_test_config(&certs, 50064);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;
@@ -1303,7 +1324,7 @@ async fn execute_prepare_invalid_capability_fails() -> Result<()> {
 
     let test_root = TempDir::new()?;
 
-    let config = create_test_config(&certs, 50065);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
 
     let mut client = create_client(&certs, server.addr()).await?;

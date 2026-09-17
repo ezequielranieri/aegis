@@ -952,6 +952,27 @@ private_key = "{}"
     }
 }
 
+/// Allocate a port free at the moment of the call (bind 127.0.0.1:0, read
+/// the assigned port, then release it for the server to bind).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("read local addr")
+        .port()
+}
+
+/// Wait until the server at `addr` accepts TCP connections (bounded).
+async fn wait_for_server(addr: std::net::SocketAddr) {
+    for _ in 0..250 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("test gRPC server at {addr} did not become ready");
+}
+
 /// gRPC test server handle (mirrors grpc_boundary's TestServer).
 struct TestServer {
     addr: SocketAddr,
@@ -979,7 +1000,7 @@ impl TestServer {
             start_server_internal_with_emitter(&config, addr, shutdown_fut, emitter_for_server)
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_server(addr).await;
 
         Ok((
             Self {
@@ -1015,7 +1036,7 @@ async fn create_client(certs: &GrpcCerts, addr: SocketAddr) -> Result<AegisRunti
     Ok(AegisRuntimeClient::new(channel))
 }
 
-/// RuntimeConfig with mTLS for the fixed test port.
+/// RuntimeConfig with mTLS for a test-allocated ephemeral port.
 fn create_test_config(certs: &GrpcCerts, port: u16) -> RuntimeConfig {
     RuntimeConfig {
         server: ServerConfig {
@@ -1079,7 +1100,7 @@ async fn network_execute_traps_via_grpc() -> Result<()> {
     _env_guard.clear();
     enable_test_mode();
     let certs = GrpcCerts::generate()?;
-    let config = create_test_config(&certs, 50071);
+    let config = create_test_config(&certs, free_port());
     let (server, _emitter) = TestServer::start_with_emitter(config).await?;
     let mut client = create_client(&certs, server.addr()).await?;
 
@@ -1180,7 +1201,7 @@ async fn network_execute_req610_success_via_grpc() -> Result<()> {
     _env_guard.set(stub.addr.port(), &ca_pem_path);
 
     let certs = GrpcCerts::generate()?;
-    let config = create_test_config(&certs, 50072);
+    let config = create_test_config(&certs, free_port());
     let (server, emitter) = TestServer::start_with_emitter(config).await?;
     let mut client = create_client(&certs, server.addr()).await?;
 

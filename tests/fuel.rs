@@ -148,6 +148,27 @@ private_key = "{}"
     }
 }
 
+/// Allocate a port free at the moment of the call (bind 127.0.0.1:0, read
+/// the assigned port, then release it for the server to bind).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("read local addr")
+        .port()
+}
+
+/// Wait until the server at `addr` accepts TCP connections (bounded).
+async fn wait_for_server(addr: std::net::SocketAddr) {
+    for _ in 0..250 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("test gRPC server at {addr} did not become ready");
+}
+
 /// Test server handle
 struct TestServer {
     addr: SocketAddr,
@@ -165,7 +186,7 @@ impl TestServer {
         };
         let handle =
             tokio::spawn(async move { start_server_internal(&config, addr, shutdown_fut).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for_server(addr).await;
         Ok(Self {
             addr,
             _shutdown: shutdown_tx,
@@ -374,7 +395,7 @@ async fn s801_execute_success_reports_fuel() -> Result<()> {
     let config = filesystem_read_config(&allowed_root, 1024);
     let wasm = wasm_test_modules::compute_then_read_module();
 
-    let resp = run_execute_test(&certs, 50060, None, wasm, config).await?;
+    let resp = run_execute_test(&certs, free_port(), None, wasm, config).await?;
 
     assert!(resp.get_ref().success, "Execute should succeed");
     assert!(
@@ -413,7 +434,7 @@ async fn s802_fuel_exhaustion() -> Result<()> {
     let config = filesystem_read_config(&allowed_root, 1024);
     let wasm = wasm_test_modules::hostile_loop_module();
 
-    let resp = run_execute_test(&certs, 50061, Some(1000), wasm, config).await?;
+    let resp = run_execute_test(&certs, free_port(), Some(1000), wasm, config).await?;
 
     assert!(
         !resp.get_ref().success,
@@ -455,7 +476,7 @@ async fn e803_d4_arm_isolation_and_ordering() -> Result<()> {
     let config = filesystem_read_config(&allowed_root, 1024);
     let wasm = wasm_test_modules::hostile_loop_module();
 
-    let resp = run_execute_test(&certs, 50062, Some(1000), wasm, config).await?;
+    let resp = run_execute_test(&certs, free_port(), Some(1000), wasm, config).await?;
 
     assert!(!resp.get_ref().success);
     assert_eq!(
@@ -480,7 +501,7 @@ async fn e804_budget_absent_uses_default() -> Result<()> {
     let config = filesystem_read_config(&allowed_root, 1024);
     let wasm = wasm_test_modules::safe_read_module();
 
-    let resp = run_execute_test(&certs, 50063, None, wasm, config).await?;
+    let resp = run_execute_test(&certs, free_port(), None, wasm, config).await?;
 
     assert!(
         resp.get_ref().success,
@@ -509,7 +530,7 @@ async fn e805_budget_explicit_honored() -> Result<()> {
     let config = filesystem_read_config(&allowed_root, 1024);
     let wasm = wasm_test_modules::compute_then_read_module();
 
-    let resp = run_execute_test(&certs, 50064, Some(5_000_000), wasm, config.clone()).await?;
+    let resp = run_execute_test(&certs, free_port(), Some(5_000_000), wasm, config.clone()).await?;
 
     assert!(
         resp.get_ref().success,
@@ -524,7 +545,7 @@ async fn e805_budget_explicit_honored() -> Result<()> {
     );
 
     let wasm2 = wasm_test_modules::hostile_loop_module();
-    let resp2 = run_execute_test(&certs, 50065, Some(5000), wasm2, config).await?;
+    let resp2 = run_execute_test(&certs, free_port(), Some(5000), wasm2, config).await?;
 
     assert!(!resp2.get_ref().success);
     assert_eq!(resp2.get_ref().error_message, "fuel budget exceeded");
@@ -548,7 +569,7 @@ async fn regression_hostile_loop_epoch_still_works() -> Result<()> {
     let config = filesystem_read_config(&allowed_root, 1024);
     let wasm = wasm_test_modules::hostile_loop_module();
 
-    let resp = run_execute_test(&certs, 50066, None, wasm, config).await?;
+    let resp = run_execute_test(&certs, free_port(), None, wasm, config).await?;
 
     assert!(!resp.get_ref().success);
     assert_eq!(resp.get_ref().error_message, "fuel budget exceeded");

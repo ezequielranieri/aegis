@@ -256,6 +256,27 @@ private_key = "{}"
     }
 }
 
+/// Allocate a port free at the moment of the call (bind 127.0.0.1:0, read
+/// the assigned port, then release it for the server to bind).
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("read local addr")
+        .port()
+}
+
+/// Wait until the server at `addr` accepts TCP connections (bounded).
+async fn wait_for_server(addr: std::net::SocketAddr) {
+    for _ in 0..250 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("test gRPC server at {addr} did not become ready");
+}
+
 /// Test server handle with address and shutdown.
 ///
 /// The `ReceiptEmitter` is returned separately by `start_with_emitter` when a
@@ -267,7 +288,7 @@ struct TestServer {
 }
 
 impl TestServer {
-    /// Start a test gRPC server on a fixed port with mTLS
+    /// Start a test gRPC server on an ephemeral port with mTLS
     /// Creates the ReceiptEmitter internally (production-like path).
     async fn start(config: RuntimeConfig) -> Result<Self> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -284,8 +305,8 @@ impl TestServer {
         let handle =
             tokio::spawn(async move { start_server_internal(&config, addr, shutdown_fut).await });
 
-        // Wait a bit for server to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the server to accept connections
+        wait_for_server(addr).await;
 
         Ok(Self {
             addr,
@@ -322,8 +343,8 @@ impl TestServer {
                 .await
         });
 
-        // Wait a bit for server to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the server to accept connections
+        wait_for_server(addr).await;
 
         Ok((
             Self {
@@ -453,8 +474,8 @@ async fn execute_rpc_violation_trap_via_grpc() -> Result<()> {
     // Enable test mode to disable epoch interruption
     enable_test_mode();
 
-    // Start server on a fixed port for this test
-    let config = create_test_config(&certs, 50051);
+    // Start server on an ephemeral port for this test
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
     let addr = server.addr();
 
@@ -525,8 +546,8 @@ async fn execute_rpc_signing_failure_via_grpc() -> Result<()> {
     // Enable test mode to disable epoch interruption
     enable_test_mode();
 
-    // Start server on a fixed port for this test, retaining the emitter
-    let config = create_test_config(&certs, 50053);
+    // Start server on an ephemeral port for this test, retaining the emitter
+    let config = create_test_config(&certs, free_port());
     let (server, emitter) = TestServer::start_with_emitter(config).await?;
     let addr = server.addr();
 
@@ -581,7 +602,7 @@ async fn execute_rpc_signing_failure_via_grpc() -> Result<()> {
 #[tokio::test]
 async fn verify_chain_tampered_receipt_via_grpc() -> Result<()> {
     let certs = TestCerts::generate()?;
-    let config = create_test_config(&certs, 50052);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
     let addr = server.addr();
 
@@ -669,8 +690,8 @@ async fn execute_rpc_happy_path_result_capture() -> Result<()> {
     // Enable test mode to disable epoch interruption
     enable_test_mode();
 
-    // Start server on a fixed port for this test
-    let config = create_test_config(&certs, 50061);
+    // Start server on an ephemeral port for this test
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
     let addr = server.addr();
 
@@ -731,7 +752,7 @@ async fn get_receipt_chain_returns_chain() -> Result<()> {
 
     enable_test_mode();
 
-    let config = create_test_config(&certs, 50062);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
     let addr = server.addr();
 
@@ -807,7 +828,7 @@ async fn verify_chain_valid_via_grpc() -> Result<()> {
 
     enable_test_mode();
 
-    let config = create_test_config(&certs, 50063);
+    let config = create_test_config(&certs, free_port());
     let server = TestServer::start(config).await?;
     let addr = server.addr();
 
