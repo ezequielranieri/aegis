@@ -751,8 +751,21 @@ impl AegisRuntimeService {
                 ))
             })?;
 
-        // Call the execute function (no arguments, returns ptr and len)
-        let (ptr, len) = execute_func.call(sandbox.store_mut(), ()).map_err(|e| {
+        // Call the execute function (no arguments, returns ptr and len).
+        // The WASM guest may issue blocking network fetches (ureq) through host
+        // functions. Running them inline on an async worker starves the runtime
+        // under load (concurrent fetches block every worker, so the stub's TLS
+        // accept can never be serviced and wall-clock timeouts fire). Move the
+        // blocking call off the async worker on multi-threaded runtimes.
+        let mut run_execute = || execute_func.call(sandbox.store_mut(), ());
+        let call_result = if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(&mut run_execute)
+        } else {
+            run_execute()
+        };
+        let (ptr, len) = call_result.map_err(|e| {
             tracing::error!(error = %e, "WASM execution trapped");
             let mut msg = e.to_string();
             if let Some(source) = e.source() {
