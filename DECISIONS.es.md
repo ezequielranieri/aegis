@@ -503,11 +503,11 @@ Usar un feature flag de Cargo `test-utils` para restringir `force_signing_failur
 El límite gRPC requiere TLS para la seguridad del transporte. El proyecto eligió TLS mutuo (mTLS) con validación del certificado de cliente frente a TLS simple (autenticación solo del servidor).
 
 ### Decisión
-Exigir mTLS con validación CN/SAN del certificado de cliente (`AegisClientCertVerifier`) para todas las conexiones gRPC.
+mTLS es configurable vía `server.tls` en `RuntimeConfig`: cuando `server.tls` está presente, el certificado de cliente es obligatorio con CN/SAN validados contra `expected_identity` (vía `AegisClientCertVerifier`); cuando está ausente, el servidor arranca sin TLS con un warning (no apto para producción).
 
 ### Justificación
 - **Autenticación mutua**: el TLS simple solo autentica al servidor ante el cliente. El mTLS autentica a ambas partes — el servidor presenta su certificado y el cliente debe presentar un certificado firmado por la CA configurada con CN/SAN que coincida con `expected_identity`. Esto es esencial para el límite agent-gateway (Go) ↔ aegis-runtime (Rust), donde debe verificarse la identidad del llamador.
-- **Cierre ante fallo por defecto**: `client_auth_mandatory()` devuelve `true` — las conexiones sin certificados de cliente válidos se rechazan con `UNAUTHENTICATED`. No existe un modo "mTLS opcional".
+- **Cierre ante fallo cuando TLS está habilitado**: el modo de cierre ante fallo existe cuando `server.tls` está configurado — `client_auth_mandatory()` devuelve `true` y las conexiones sin certificado de cliente válido se rechazan con `UNAUTHENTICATED`. Sin `server.tls`, no hay cifrado en absoluto y el arranque emite un warning. mTLS es opcional de configurar, pero cuando TLS está habilitado la autenticación del cliente es obligatoria — no existe modo TLS únicamente para el servidor.
 - **Validación CN/SAN**: el `AegisClientCertVerifier` personalizado verifica tanto el Common Name (`CN=agent-gateway`) como los Subject Alternative Names (DNS/URI) contra `RuntimeConfig.tls.expected_identity`. Esto proporciona defensa en profundidad: incluso si una CA emite un certificado solo con CN, el SAN también debe coincidir; y viceversa.
 - **Identidad configurable**: la identidad esperada no está fijada en el código — es `expected_identity` en `TlsConfig`, lo que permite que diferentes entornos (dev/staging/prod) usen identidades de llamador distintas.
 - **El TLS simple fue rechazado**: el TLS simple permitiría que cualquier cliente con un certificado válido firmado por la CA se conectara, incluidos agent-gateway no autorizados o actores maliciosos que obtengan un certificado firmado por la CA.
@@ -519,7 +519,7 @@ Exigir mTLS con validación CN/SAN del certificado de cliente (`AegisClientCertV
 - El `AegisClientCertVerifier` parsea certificados X.509 manualmente con `x509-parser` — posible fragilidad si cambian los formatos de certificados.
 
 ### Consecuencias
-- Cada despliegue de `aegis-runtime` requiere cert de CA, cert/clave de servidor y cert/clave de cliente configurados en `RuntimeConfig`.
+- Cada despliegue de `aegis-runtime` con mTLS habilitado requiere cert de CA, cert/clave de servidor y cert/clave de cliente configurados en `RuntimeConfig`.
 - Las pruebas de integración `grpc_boundary.rs` generan certificados efímeros vía `rcgen` para probar mTLS.
 - Si TLS no está configurado (`config.server.tls = None`), el servidor advierte pero igual se inicia — esta es una brecha conocida (no se exige mTLS en producción).
 

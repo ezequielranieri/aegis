@@ -25,3 +25,5 @@ key_path = "/etc/aegis/signing_key.toml"
 # subsequent requests receive RESOURCE_EXHAUSTED.
 [execution]
 max_concurrent = 8
+# Fuel budget for WASM execution (REQ-706, AD-015); default is 10_000_000
+fuel_budget = 10_000_000

@@ -23,7 +23,7 @@ Standalone binary entry point for the aegis runtime gRPC service. Loads configur
 | REQ-811 | Binary SHALL NOT export, log, or expose the Ed25519 private key in any form | MUST |
 | REQ-812 | Binary SHALL be buildable via `cargo build --bin aegis-runtime` | MUST |
 | REQ-820 | The `Capability` enum SHALL include a variant for two-phase receipt execution capability. This is **not a new host function capability** — it is a **p | MUST |
-| REQ-821 | `PolicyConfig::try_into_capabilities()` SHALL recognize a `two_phase_receipts = true` (or `[capabilities.two_phase_receipts]`) key in the TOML config  | MUST |
+| REQ-821 | `PolicyConfig::try_into_capabilities()` SHALL recognize a `[[capabilities]]` entry with `name = "two_phase_receipts"` in the TOML config  | MUST |
 | REQ-822 | The `ExecutePrepare` RPC handler SHALL validate that `Capability::TwoPhaseReceipts` is present in the granted capabilities. If not granted, return `FA | MUST |
 | REQ-823 | `ExecuteCommit` and `ExecuteAbort` RPCs SHALL NOT re-validate capabilities — they are authorized by virtue of the `prepare_hash` which was issued by a | MUST |
 
@@ -42,7 +42,7 @@ Standalone binary entry point for the aegis runtime gRPC service. Loads configur
 | S-808 | mTLS client cert validation | Config includes `ca_cert_path`, client connects with valid client cert signed by CA | Client sends ExecuteRequest | Request succeeds, response with receipt |
 | S-809 | mTLS rejects invalid client cert | Config includes `ca_cert_path`, client connects with self-signed cert or wrong CA | Client sends ExecuteRequest | Request rejected with INVALID_CERT status, no execution |
 | S-810 | mTLS rejects missing client cert | Config includes `ca_cert_path`, client connects without client cert | Client sends ExecuteRequest | Request rejected with INVALID_CERT status, no execution |
-| S-970 | TwoPhaseReceipts granted |  Config with `two_phase_receipts = true` |  ExecutePrepare called |  `success=true`, prepare receipt emitted |
+| S-970 | TwoPhaseReceipts granted |  Config with `[[capabilities]] name = "two_phase_receipts"` |  ExecutePrepare called |  `success=true`, prepare receipt emitted |
 | S-971 | TwoPhaseReceipts denied |  Config WITHOUT `two_phase_receipts` |  ExecutePrepare called |  `success=false`, "two-phase receipts capability not granted" |
 | S-972 | Legacy Execute works without capability |  Config WITHOUT `two_phase_receipts` |  Legacy Execute called |  Works (backward compat) |
 | S-973 | ExecuteCommit authorized by prepare_hash |  Prepare succeeded, commit called |  ExecuteCommit with prepare_hash |  `success=true`, no capability re-check |

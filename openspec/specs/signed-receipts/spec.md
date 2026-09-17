@@ -65,7 +65,7 @@ The optional CLI verifier (`aegis-verify`) SHALL continue to work unchanged. It 
 
 `ExecutionReceipt` SHALL gain two new fields, declared **before `timestamp_ns`** to preserve canonical serialization order for backward compatibility:
 - `phase: String` — one of `""` (legacy/host functions), `"prepare"`, `"commit"`, `"abort"`. Default `""` for backward compat.
-- `pending_hash: [u8; 32]` — the BLAKE3 chain hash of the prepare receipt (`blake3(prev_hash || prepare_canonical_bytes)`). Non-zero **only** when `phase="prepare"`. For all other phases, `pending_hash = [0u8; 32]` and SHALL be serialized with `skip_serializing_if = "is_zero_array"` so legacy receipts and non-prepare receipts serialize byte-identically to pre-change schema.
+- `pending_hash: [u8; 32]` — the BLAKE3 chain hash of the prepare receipt (`blake3(prev_hash || prepare_canonical_bytes)`). Non-zero in all three phases: derived in `phase="prepare"` and copied from the prepare receipt in `phase="commit"` and `phase="abort"`. Only legacy receipts (`phase=""`) SHALL have `pending_hash = [0u8; 32]` and SHALL be serialized with `skip_serializing_if = "is_zero_array"` so they serialize byte-identically to the pre-change schema.
 
 
 ### REQ-751: Two-Phase Receipt Flow
@@ -97,6 +97,7 @@ pub fn prepare(
     capability: &str,
     config: &PolicyConfig,
     wasm_module: &[u8],
+    fuel_budget: Option<u64>,
 ) -> Result<(ExecutionReceipt, PrepareHandle)>;
 
 pub fn commit(
