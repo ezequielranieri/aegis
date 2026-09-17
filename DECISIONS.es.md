@@ -524,7 +524,7 @@ Exigir mTLS con validación CN/SAN del certificado de cliente (`AegisClientCertV
 - Si TLS no está configurado (`config.server.tls = None`), el servidor advierte pero igual se inicia — esta es una brecha conocida (no se exige mTLS en producción).
 
 ### Trazabilidad
-- Fuente: `AegisClientCertVerifier` en `src/grpc/tls.rs`, `TlsConfig` en `src/config/runtime.rs`, `build_tonic_tls_config` en `src/grpc/server.rs`
+- Fuente: `AegisClientCertVerifier` + `build_tls_config` en `src/grpc/tls.rs`, `TlsConfig` en `src/config/runtime.rs`, acceptor TLS en `src/grpc/server.rs`
 - Spec: REQ-713, REQ-716
 
 ---

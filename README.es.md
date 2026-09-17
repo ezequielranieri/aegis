@@ -12,11 +12,11 @@
 
 Ejecutar WebAssembly no confiable solo es seguro si cada acceso a recursos está restringido y cada efecto secundario es verificable. aegis aplica un modelo de seguridad con cierre ante fallo (fail-closed) a la ejecución de WASM:
 
-- **Funciones host basadas en capacidades** en lugar de WASI: los guest reciben exactamente las capacidades declaradas en la política — `filesystem.read`, `filesystem.write`, `network.http` — y nada más. Cada capacidad otorga acceso acotado y validado (por ejemplo, un `allowed_root` para acceso a archivos o allowlists de hosts para HTTP).
+- **Funciones host basadas en capacidades** en lugar de WASI: hay cuatro nombres de capability — `filesystem.read`, `filesystem.write`, `network.http`, `two_phase_receipts` — y los guest reciben exactamente los declarados en la política — y nada más. Solo los tres primeros son ejecutables; `two_phase_receipts` es un marcador que habilita los RPC de dos fases (`ExecutePrepare`/`ExecuteCommit`/`ExecuteAbort`), no una capability ejecutable. Cada capability ejecutable otorga acceso acotado y validado (por ejemplo, un `allowed_root` para acceso a archivos o allowlists de hosts para HTTP).
 - **Recibos de ejecución firmados y encadenados por hash**: cada ejecución produce un recibo firmado con Ed25519 (hash BLAKE3 encadenado) que prueba *qué se ejecutó, con qué resultado y a qué costo*. Los recibos son verificables offline con `aegis-verify`.
 - **Ejecución de dos fases**: `ExecutePrepare` / `ExecuteCommit` / `ExecuteAbort` producen un recibo `prepare` firmado antes de ejecutar cualquier WASM y luego un recibo `commit` (o `abort`) firmado — de modo que tanto la intención como el resultado son verificables.
 - **Límites de recursos estrictos**: sandbox Wasmtime con 1 MiB de memoria, 1024 elementos de tabla, 4 instancias y 2 memorias por store; interrupción por época como límite de CPU en tiempo de reloj y metering de fuel para contabilidad determinista de CPU por ejecución.
-- **TLS mutuo en el límite gRPC**: el servidor exige certificados de cliente firmados por una CA configurada cuyo CN/SAN coincida con la identidad esperada — no existe un modo de TLS opcional.
+- **TLS mutuo en el límite gRPC**: el mTLS se configura mediante `server.tls` — cuando está presente, el servidor exige certificados de cliente firmados por la CA configurada con CN/SAN que coincida con `expected_identity`. Sin configurar, el servidor arranca con una advertencia y conexiones sin cifrar (no apto para producción).
 
 ## Arquitectura
 
@@ -74,10 +74,10 @@ host = "0.0.0.0"
 port = 50051
 
 [server.tls]              # mTLS: el CN/SAN del certificado de cliente debe coincidir con expected_identity
-# ca_cert, server_cert, server_key, expected_identity ...
+# cert_path, key_path, ca_cert_path, expected_identity
 
 [receipts]
-key_path = "/etc/aegis/keys/ed25519-private.pkcs8.pem"
+key_path = "/etc/aegis/signing_key.toml"  # TOML: [signing_key] con private_key base64 (PKCS8), permisos 0600
 
 [execution]
 max_concurrent = 8        # ejecuciones en curso; al excederse → RESOURCE_EXHAUSTED

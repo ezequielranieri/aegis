@@ -12,11 +12,11 @@
 
 Running untrusted WebAssembly is only safe when every resource access is gated and every side effect is provable. aegis applies a fail-closed security model to WASM execution:
 
-- **Capability-based host functions** instead of WASI: guests get exactly the capabilities declared in the policy — `filesystem.read`, `filesystem.write`, `network.http` — nothing else. Each capability grants narrow, validated access (e.g., an `allowed_root` for filesystem access or host allowlists for HTTP).
+- **Capability-based host functions** instead of WASI: there are four capability names — `filesystem.read`, `filesystem.write`, `network.http`, `two_phase_receipts` — and guests get exactly the ones declared in the policy — nothing more. Only the first three are executable; `two_phase_receipts` is a marker that enables the two-phase RPCs (`ExecutePrepare`/`ExecuteCommit`/`ExecuteAbort`), not an executable capability. Each executable capability grants narrow, validated access (e.g., an `allowed_root` for filesystem access or host allowlists for HTTP).
 - **Signed, hash-chained execution receipts**: every execution produces an Ed25519-signed receipt (BLAKE3-hashed and chained) that proves *what executed, with what result, at what cost*. Receipts are verifiable offline with `aegis-verify`.
 - **Two-phase execution**: `ExecutePrepare` / `ExecuteCommit` / `ExecuteAbort` produce a signed `prepare` receipt before any WASM runs, then a signed `commit` (or `abort`) receipt after — so intent and outcome are both provable.
 - **Hard resource limits**: Wasmtime sandbox with 1 MiB memory, 1024 table elements, 4 instances, 2 memories per store, epoch interruption as the wall-clock CPU boundary, and fuel metering for deterministic per-execution CPU accounting.
-- **Mutual TLS on the gRPC boundary**: the server requires client certificates signed by a configured CA with CN/SAN matching the expected identity — there is no optional-TLS mode.
+- **Mutual TLS on the gRPC boundary**: mTLS is configurable via `server.tls` — when it is present, the server requires client certificates signed by the configured CA with CN/SAN matching `expected_identity`. Without it, the server starts with a warning and unencrypted connections (not suitable for production).
 
 ## Architecture
 
@@ -74,10 +74,10 @@ host = "0.0.0.0"
 port = 50051
 
 [server.tls]              # mTLS: client cert CN/SAN must match expected_identity
-# ca_cert, server_cert, server_key, expected_identity ...
+# cert_path, key_path, ca_cert_path, expected_identity
 
 [receipts]
-key_path = "/etc/aegis/keys/ed25519-private.pkcs8.pem"
+key_path = "/etc/aegis/signing_key.toml"  # TOML: [signing_key] with base64 private_key (PKCS8), perms 0600
 
 [execution]
 max_concurrent = 8        # in-flight executions; exceeded → RESOURCE_EXHAUSTED

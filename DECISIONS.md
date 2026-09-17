@@ -521,7 +521,7 @@ Require mTLS with CN/SAN client certificate validation (`AegisClientCertVerifier
 - If TLS is not configured (`config.server.tls = None`), the server warns but still starts — this is a known gap (no enforcement that mTLS is required in production)
 
 ### Traceability
-- Source: `src/grpc/tls.rs` `AegisClientCertVerifier`, `src/config/runtime.rs` `TlsConfig`, `src/grpc/server.rs` `build_tonic_tls_config`
+- Source: `src/grpc/tls.rs` `AegisClientCertVerifier` + `build_tls_config`, `src/config/runtime.rs` `TlsConfig`, `src/grpc/server.rs` TLS acceptor (tokio_rustls)
 - Spec: REQ-713, REQ-716
 
 ---

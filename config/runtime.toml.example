@@ -7,7 +7,9 @@ port = 50051
 
 # mTLS configuration (REQ-713, REQ-716)
 # When present, mutual TLS is required — clients must present a valid
-# certificate signed by the configured CA.
+# certificate signed by the configured CA with CN/SAN matching
+# expected_identity. Without this section the server starts with a warning
+# and unencrypted connections (not suitable for production).
 [server.tls]
 cert_path = "/etc/aegis/server.crt"
 key_path = "/etc/aegis/server.key"
