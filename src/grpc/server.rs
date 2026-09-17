@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::StreamExt;
 use tonic::transport::Server;
 
 use crate::config::runtime::RuntimeConfig;
@@ -113,24 +115,55 @@ async fn start_server_with_emitter(
     let local_addr = listener.local_addr()?;
     tracing::info!(addr = %local_addr, "starting gRPC server");
 
-    // 6. Build tonic server with TLS if configured (REQ-713)
-    let mut server = Server::builder();
+    // 6. Build the tonic server with all services
+    let server = Server::builder()
+        .add_service(AegisRuntimeServer::new(aegis_service))
+        .add_service(HealthServer::new(health_service));
 
+    // 7. Terminate connections with mTLS when configured (REQ-713, REQ-716).
+    //
+    // tonic cannot host a custom `ClientCertVerifier`, so we terminate TLS
+    // ourselves with tokio_rustls (`build_tls_config` applies CN/SAN
+    // validation via `AegisClientCertVerifier`) and hand the accepted TLS
+    // streams to tonic. A failed handshake is logged and dropped — it must
+    // not kill the server.
     if let Some(ref tls_config) = config.server.tls {
-        let tonic_tls_config = tls::build_tonic_tls_config(tls_config)?;
-        server = server.tls_config(tonic_tls_config)?;
-        tracing::info!("mTLS configured");
+        let tls_server_config = tls::build_tls_config(tls_config)?;
+        let acceptor = TlsAcceptor::from(Arc::new(tls_server_config));
+        tracing::info!("mTLS configured (CN/SAN validation)");
+
+        let incoming = TcpListenerStream::new(listener)
+            .then(move |conn| {
+                let acceptor = acceptor.clone();
+                async move {
+                    match conn {
+                        Ok(stream) => match acceptor.accept(stream).await {
+                            Ok(tls_stream) => Some(Ok::<_, std::io::Error>(tls_stream)),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "TLS handshake failed");
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "TCP accept failed");
+                            None
+                        }
+                    }
+                }
+            })
+            .filter_map(|item| item);
+
+        server
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await
+            .map_err(|e| anyhow::anyhow!("gRPC server error: {}", e))?;
     } else {
         tracing::warn!("TLS not configured — connections are unencrypted");
+        server
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+            .await
+            .map_err(|e| anyhow::anyhow!("gRPC server error: {}", e))?;
     }
-
-    // 7. Serve via TcpListenerStream (supports TLS accept internally)
-    server
-        .add_service(AegisRuntimeServer::new(aegis_service))
-        .add_service(HealthServer::new(health_service))
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
-        .await
-        .map_err(|e| anyhow::anyhow!("gRPC server error: {}", e))?;
 
     tracing::info!("gRPC server stopped");
     Ok(local_addr)

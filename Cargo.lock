@@ -31,6 +31,7 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_bytes",
  "serde_json",
